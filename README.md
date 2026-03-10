@@ -102,27 +102,94 @@ yum install fuse3
 
 ## Building from source
 
-The binary is built automatically by GitHub Actions. To build locally, you need `libfuse3-dev` and `libnfs-dev`:
+### CI build
+
+The GitHub Actions workflow automatically builds a fully static binary inside an Alpine container. It clones the latest stable [libnfs](https://github.com/sahlberg/libnfs) and [libfuse3](https://github.com/libfuse/libfuse) from source, compiles them as static libraries, and links everything into a single portable binary.
+
+The libnfs version is controlled by the `LIBNFS_TAG` variable at the top of `.github/workflows/build.yml`:
+
+```yaml
+env:
+  LIBNFS_TAG: libnfs-6.0.2
+```
+
+To change the libnfs version, update this tag to any release from the [libnfs releases page](https://github.com/sahlberg/libnfs/tags) (e.g. `libnfs-5.0.3`, `libnfs-6.0.1`). Push the change and CI will rebuild with that version.
+
+### Building locally with system packages
+
+If your distro ships `libnfs-dev` and `libfuse3-dev`:
 
 ```bash
-# Install build dependencies (Debian/Ubuntu)
+# Debian/Ubuntu
 apt-get install gcc libfuse3-dev libnfs-dev pkg-config
 
-# Compile
 gcc -O2 -Wall -o nfsfuse nfsfuse.c \
-    $(pkg-config --cflags --libs fuse3 libnfs) \
-    -lpthread
-
-# Or with version info
-gcc -O2 -Wall -o nfsfuse nfsfuse.c \
-    -DNFSFUSE_VERSION='"1.0.0"' \
-    -DNFSFUSE_BUILD='"1"' \
-    -DNFSFUSE_LIBNFS_VERSION='"system"' \
-    -DNFSFUSE_BUILD_DATE='"$(date -u)"' \
-    -DNFSFUSE_BUILD_HOST='"$(hostname)"' \
     $(pkg-config --cflags --libs fuse3 libnfs) \
     -lpthread
 ```
+
+### Building locally with libnfs from source
+
+To use a specific libnfs version (recommended for best compatibility):
+
+```bash
+# Install build tools and libfuse3
+apt-get install gcc cmake git pkg-config libfuse3-dev
+
+# Clone and build libnfs (change the tag for a different version)
+LIBNFS_TAG=libnfs-6.0.2
+git clone --depth 1 --branch "$LIBNFS_TAG" https://github.com/sahlberg/libnfs.git /tmp/libnfs
+cd /tmp/libnfs
+mkdir build && cd build
+cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+make -j$(nproc)
+sudo make install
+
+# Build nfsfuse
+export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
+gcc -O2 -Wall -o nfsfuse nfsfuse.c \
+    -DNFSFUSE_LIBNFS_VERSION="\"$LIBNFS_TAG\"" \
+    $(pkg-config --cflags fuse3 libnfs) \
+    $(pkg-config --libs --static fuse3 libnfs) \
+    -lpthread
+```
+
+### Fully static build (portable binary)
+
+To produce a single static binary with no runtime dependencies (like the CI does):
+
+```bash
+# Requires: gcc, cmake, git, meson, ninja, pkg-config, linux-headers, musl-dev (on Alpine)
+# Or run inside the Alpine Docker container:
+docker run --rm -v "$PWD:/src" -w /src alpine:latest sh -exc '
+  apk add --no-cache gcc musl-dev make cmake git meson ninja pkgconf linux-headers
+
+  LIBNFS_TAG=libnfs-6.0.2
+
+  # Build libnfs
+  git clone --depth 1 --branch "$LIBNFS_TAG" https://github.com/sahlberg/libnfs.git /tmp/libnfs
+  cd /tmp/libnfs && mkdir build && cd build
+  cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+  make -j$(nproc) && make install
+
+  # Build libfuse3
+  git clone --depth 1 https://github.com/libfuse/libfuse.git /tmp/libfuse
+  cd /tmp/libfuse && mkdir build && cd build
+  meson setup .. --default-library=static --prefix=/usr -Dexamples=false -Dutils=false
+  ninja && ninja install
+
+  # Compile nfsfuse
+  cd /src
+  gcc -O2 -Wall -o nfsfuse nfsfuse.c -static \
+      -DNFSFUSE_LIBNFS_VERSION="\"$LIBNFS_TAG\"" \
+      $(pkg-config --cflags fuse3 libnfs) \
+      $(pkg-config --libs --static fuse3 libnfs) \
+      -lpthread
+  strip nfsfuse
+'
+```
+
+The resulting binary runs on any Linux with FUSE kernel support (Debian 8+, Ubuntu 14.04+, CentOS 7+, etc.).
 
 ## Supported operations
 
