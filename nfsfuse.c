@@ -1192,7 +1192,7 @@ static struct fuse_operations nfuse_ops = {
 
 static void usage(const char *prog)
 {
-    print_version();
+    fprintf(stderr, "nfsfuse %s\n", NFSFUSE_VERSION);
     fprintf(stderr,
         "\nUsage:\n"
         "  %s [--max] [--debug] nfs://server/export/path[?version=3|4] <mountpoint> [FUSE options]\n\n"
@@ -1323,7 +1323,8 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    print_version();
+    if (g_debug)
+        print_version();
 
     if (pthread_mutex_init(&g_state.meta_lock, NULL) != 0) {
         fprintf(stderr, "pthread_mutex_init failed\n");
@@ -1450,9 +1451,17 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    DBG("nfsfuse: starting fuse (argc=%d)\n", fuse_argc);
-    for (i = 0; i < fuse_argc && g_debug; i++)
-        DBG("  argv[%d]=%s\n", i, fuse_argv[i]);
+    if (g_debug) {
+        DBG("nfsfuse: starting fuse (argc=%d)\n", fuse_argc);
+        for (i = 0; i < fuse_argc; i++)
+            DBG("  argv[%d]=%s\n", i, fuse_argv[i]);
+    } else {
+        fprintf(stderr, "nfsfuse: %s mounted on %s (nfsv%s%s)\n",
+                g_state.fsname ? g_state.fsname : argv[url_idx],
+                argv[mount_idx],
+                g_state.safe_v4_mode ? "4" : "3",
+                g_state.max_mode ? ", max" : "");
+    }
 
     rc = fuse_main(fuse_argc, fuse_argv, &nfuse_ops, NULL);
 
