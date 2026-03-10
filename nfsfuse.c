@@ -66,6 +66,17 @@
 #define CALL_NFS_MKDIR(ctx, path, mode) ((void)(mode), nfs_mkdir((ctx), (path)))
 #endif
 
+static int g_debug = 0;
+
+#define DBG(...) do { if (g_debug) fprintf(stderr, __VA_ARGS__); } while (0)
+
+static void print_version(void)
+{
+    fprintf(stderr, "nfsfuse %s (build %s)\n", NFSFUSE_VERSION, NFSFUSE_BUILD);
+    fprintf(stderr, "  libnfs: %s\n", NFSFUSE_LIBNFS_VERSION);
+    fprintf(stderr, "  built:  %s on %s\n", NFSFUSE_BUILD_DATE, NFSFUSE_BUILD_HOST);
+}
+
 struct app_state {
     char *url_base;
     char *url_effective;
@@ -1178,17 +1189,6 @@ static struct fuse_operations nfuse_ops = {
     .fsync      = nfuse_fsync,
     .statfs     = nfuse_statfs,
 };
-
-static int g_debug = 0;
-
-#define DBG(...) do { if (g_debug) fprintf(stderr, __VA_ARGS__); } while (0)
-
-static void print_version(void)
-{
-    fprintf(stderr, "nfsfuse %s (build %s)\n", NFSFUSE_VERSION, NFSFUSE_BUILD);
-    fprintf(stderr, "  libnfs: %s\n", NFSFUSE_LIBNFS_VERSION);
-    fprintf(stderr, "  built:  %s on %s\n", NFSFUSE_BUILD_DATE, NFSFUSE_BUILD_HOST);
-}
 
 static void usage(const char *prog)
 {
