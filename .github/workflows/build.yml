@@ -23,8 +23,8 @@ jobs:
             apk add --no-cache \
               gcc musl-dev make cmake git meson ninja pkgconf linux-headers
 
-            # Build latest libnfs as static library
-            git clone --depth 1 https://github.com/sahlberg/libnfs.git /tmp/libnfs
+            # Build libnfs 6.0.2 as static library
+            git clone --depth 1 --branch libnfs-6.0.2 https://github.com/sahlberg/libnfs.git /tmp/libnfs
             cd /tmp/libnfs
             mkdir build && cd build
             cmake .. \
