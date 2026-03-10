@@ -1320,9 +1320,14 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    fprintf(stderr, "nfsfuse: url=%s v4=%d max=%d\n",
+            g_state.url_effective, g_state.safe_v4_mode, g_state.max_mode);
+
     g_state.fsname = build_fsname_from_url(g_state.url_base);
     if (g_state.fsname == NULL)
         g_state.fsname = xstrdup("nfsfuse");
+
+    fprintf(stderr, "nfsfuse: mounting...\n");
 
     g_state.meta_nfs = mount_new_context(g_state.url_effective);
     if (g_state.meta_nfs == NULL) {
@@ -1333,6 +1338,8 @@ int main(int argc, char *argv[])
 
     readmax = nfs_get_readmax(g_state.meta_nfs);
     writemax = nfs_get_writemax(g_state.meta_nfs);
+
+    fprintf(stderr, "nfsfuse: mounted, readmax=%zu writemax=%zu\n", readmax, writemax);
 
     if (g_state.max_mode) {
         g_state.io_chunk = NFUSE_MAX_IO_CHUNK;
@@ -1391,6 +1398,10 @@ int main(int argc, char *argv[])
         cleanup_app_state();
         return 1;
     }
+
+    fprintf(stderr, "nfsfuse: starting fuse (argc=%d)\n", fuse_argc);
+    for (i = 0; i < fuse_argc; i++)
+        fprintf(stderr, "  argv[%d]=%s\n", i, fuse_argv[i]);
 
     rc = fuse_main(fuse_argc, fuse_argv, &nfuse_ops, NULL);
 
