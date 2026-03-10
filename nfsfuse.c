@@ -307,22 +307,32 @@ static struct nfs_context *mount_new_context(const char *url)
     struct nfs_context *ctx = NULL;
     struct nfs_url *nurl = NULL;
 
+    fprintf(stderr, "  nfs_init_context...\n");
     ctx = nfs_init_context();
     if (ctx == NULL)
         return NULL;
 
+    fprintf(stderr, "  nfs_parse_url_dir...\n");
     nurl = nfs_parse_url_dir(ctx, url);
     if (nurl == NULL) {
+        fprintf(stderr, "  parse failed: %s\n", nfs_get_error(ctx));
         nfs_destroy_context(ctx);
         return NULL;
     }
 
+    fprintf(stderr, "  server=%s path=%s\n",
+            nurl->server ? nurl->server : "(null)",
+            nurl->path ? nurl->path : "(null)");
+
+    fprintf(stderr, "  nfs_mount...\n");
     if (nfs_mount(ctx, nurl->server, nurl->path) != 0) {
+        fprintf(stderr, "  mount failed: %s\n", nfs_get_error(ctx));
         nfs_destroy_url(nurl);
         nfs_destroy_context(ctx);
         return NULL;
     }
 
+    fprintf(stderr, "  mount ok\n");
     nfs_destroy_url(nurl);
     return ctx;
 }
