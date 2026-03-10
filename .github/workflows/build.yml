@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    paths-ignore: ['bin/**']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -60,10 +61,13 @@ jobs:
           file bin/nfsfuse
           ls -lh bin/nfsfuse
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: nfsfuse
-          path: bin/nfsfuse
+      - name: Commit binary to repo
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f bin/nfsfuse
+          git diff --cached --quiet && echo "No changes" || git commit -m "Update bin/nfsfuse" && git push
 
   release:
     needs: build
