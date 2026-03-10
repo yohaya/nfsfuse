@@ -196,13 +196,22 @@ The resulting binary runs on any Linux with FUSE kernel support (Debian 8+, Ubun
 | Operation | Description |
 |-----------|--------------------------|
 | getattr | Stat files and directories |
+| access | Check file access permissions |
+| readlink | Read symbolic link target |
 | opendir / readdir / releasedir | List directory contents |
 | open / create / release | Open, create, close files |
+| mknod | Create device/special files |
 | read / write | Read and write file data |
 | truncate | Truncate files |
+| utimens | Set file timestamps |
+| chmod | Change file permissions |
+| chown | Change file owner/group |
 | unlink | Delete files |
 | mkdir / rmdir | Create and remove directories |
 | rename | Rename files and directories |
+| symlink | Create symbolic links |
+| link | Create hard links |
+| fsync | Flush file data to server |
 | statfs | Filesystem statistics |
 
 ## License

@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -986,9 +987,33 @@ static int nfuse_truncate(const char *path, off_t size, struct fuse_file_info *f
 static int nfuse_utimens(const char *path, const struct timespec tv[2],
                          struct fuse_file_info *fi)
 {
-    (void)path;
-    (void)tv;
+    struct timeval times[2];
+    int rc;
+
     (void)fi;
+
+    if (path == NULL)
+        return -EINVAL;
+
+    if (tv == NULL) {
+        times[0].tv_sec = 0;
+        times[0].tv_usec = 0;
+        times[1].tv_sec = 0;
+        times[1].tv_usec = 0;
+    } else {
+        times[0].tv_sec = tv[0].tv_sec;
+        times[0].tv_usec = (suseconds_t)(tv[0].tv_nsec / 1000);
+        times[1].tv_sec = tv[1].tv_sec;
+        times[1].tv_usec = (suseconds_t)(tv[1].tv_nsec / 1000);
+    }
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    rc = nfs_utimes(g_state.meta_nfs, path, times);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    if (rc < 0)
+        return nfs_err(rc);
+
     return 0;
 }
 
@@ -1053,6 +1078,134 @@ static int nfuse_rename(const char *from, const char *to, unsigned int flags)
     return 0;
 }
 
+static int nfuse_readlink(const char *path, char *buf, size_t size)
+{
+    char *target = NULL;
+    int rc;
+
+    if (path == NULL || buf == NULL || size == 0)
+        return -EINVAL;
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    rc = nfs_readlink(g_state.meta_nfs, path, &target);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    if (rc < 0)
+        return nfs_err(rc);
+
+    strncpy(buf, target, size - 1);
+    buf[size - 1] = '\0';
+    free(target);
+    return 0;
+}
+
+static int nfuse_symlink(const char *target, const char *linkpath)
+{
+    int rc;
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    rc = nfs_symlink(g_state.meta_nfs, target, linkpath);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    if (rc < 0)
+        return nfs_err(rc);
+
+    return 0;
+}
+
+static int nfuse_link(const char *oldpath, const char *newpath)
+{
+    int rc;
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    rc = nfs_link(g_state.meta_nfs, oldpath, newpath);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    if (rc < 0)
+        return nfs_err(rc);
+
+    return 0;
+}
+
+static int nfuse_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
+{
+    int rc;
+
+    if (fi && fi->fh) {
+        struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
+
+        file_handle_lock(h);
+        rc = nfs_fchmod(h->ctx, h->fh, mode);
+        file_handle_unlock(h);
+    } else {
+        if (path == NULL)
+            return -EINVAL;
+
+        pthread_mutex_lock(&g_state.meta_lock);
+        rc = nfs_chmod(g_state.meta_nfs, path, mode);
+        pthread_mutex_unlock(&g_state.meta_lock);
+    }
+
+    if (rc < 0)
+        return nfs_err(rc);
+
+    return 0;
+}
+
+static int nfuse_chown(const char *path, uid_t uid, gid_t gid,
+                       struct fuse_file_info *fi)
+{
+    int rc;
+
+    if (fi && fi->fh) {
+        struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
+
+        file_handle_lock(h);
+        rc = nfs_fchown(h->ctx, h->fh, uid, gid);
+        file_handle_unlock(h);
+    } else {
+        if (path == NULL)
+            return -EINVAL;
+
+        pthread_mutex_lock(&g_state.meta_lock);
+        rc = nfs_chown(g_state.meta_nfs, path, uid, gid);
+        pthread_mutex_unlock(&g_state.meta_lock);
+    }
+
+    if (rc < 0)
+        return nfs_err(rc);
+
+    return 0;
+}
+
+static int nfuse_mknod(const char *path, mode_t mode, dev_t rdev)
+{
+    int rc;
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    rc = nfs_mknod(g_state.meta_nfs, path, mode, (int)rdev);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    if (rc < 0)
+        return nfs_err(rc);
+
+    return 0;
+}
+
+static int nfuse_access(const char *path, int mask)
+{
+    int rc;
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    rc = nfs_access(g_state.meta_nfs, path, mask);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    if (rc < 0)
+        return nfs_err(rc);
+
+    return 0;
+}
+
 static int nfuse_flush(const char *path, struct fuse_file_info *fi)
 {
     (void)path;
@@ -1062,9 +1215,24 @@ static int nfuse_flush(const char *path, struct fuse_file_info *fi)
 
 static int nfuse_fsync(const char *path, int datasync, struct fuse_file_info *fi)
 {
+    struct file_handle *h;
+    int rc;
+
     (void)path;
     (void)datasync;
-    (void)fi;
+
+    if (fi == NULL || fi->fh == 0)
+        return 0;
+
+    h = (struct file_handle *)(uintptr_t)fi->fh;
+
+    file_handle_lock(h);
+    rc = nfs_fsync(h->ctx, h->fh);
+    file_handle_unlock(h);
+
+    if (rc < 0)
+        return nfs_err(rc);
+
     return 0;
 }
 
@@ -1166,6 +1334,8 @@ static struct fuse_operations nfuse_ops = {
     .destroy    = nfuse_destroy,
 
     .getattr    = nfuse_getattr,
+    .access     = nfuse_access,
+    .readlink   = nfuse_readlink,
 
     .opendir    = nfuse_opendir,
     .readdir    = nfuse_readdir,
@@ -1174,16 +1344,22 @@ static struct fuse_operations nfuse_ops = {
     .open       = nfuse_open,
     .create     = nfuse_create,
     .release    = nfuse_release,
+    .mknod      = nfuse_mknod,
 
     .read       = nfuse_read,
     .write      = nfuse_write,
     .truncate   = nfuse_truncate,
     .utimens    = nfuse_utimens,
 
+    .chmod      = nfuse_chmod,
+    .chown      = nfuse_chown,
+
     .unlink     = nfuse_unlink,
     .mkdir      = nfuse_mkdir,
     .rmdir      = nfuse_rmdir,
     .rename     = nfuse_rename,
+    .symlink    = nfuse_symlink,
+    .link       = nfuse_link,
 
     .flush      = nfuse_flush,
     .fsync      = nfuse_fsync,
