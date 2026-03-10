@@ -9,6 +9,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+env:
+  LIBNFS_TAG: libnfs-6.0.2
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -16,15 +19,32 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute build number and version
+        id: meta
+        run: |
+          VERSION=$(cat VERSION)
+          BUILD=$(git rev-list --count HEAD)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%d_%H:%M:%S_UTC)" >> "$GITHUB_OUTPUT"
+          echo "Building nfsfuse $VERSION build $BUILD"
 
       - name: Build static binary in Alpine container
         run: |
-          docker run --rm -v "$PWD:/src" -w /src alpine:latest sh -exc '
+          docker run --rm -v "$PWD:/src" -w /src \
+            -e VERSION="${{ steps.meta.outputs.version }}" \
+            -e BUILD="${{ steps.meta.outputs.build }}" \
+            -e BUILD_DATE="${{ steps.meta.outputs.date }}" \
+            -e LIBNFS_TAG="${{ env.LIBNFS_TAG }}" \
+            alpine:latest sh -exc '
             apk add --no-cache \
               gcc musl-dev make cmake git meson ninja pkgconf linux-headers
 
-            # Build libnfs 6.0.2 as static library
-            git clone --depth 1 --branch libnfs-6.0.2 https://github.com/sahlberg/libnfs.git /tmp/libnfs
+            # Build libnfs as static library
+            git clone --depth 1 --branch "$LIBNFS_TAG" https://github.com/sahlberg/libnfs.git /tmp/libnfs
             cd /tmp/libnfs
             mkdir build && cd build
             cmake .. \
@@ -52,6 +72,11 @@ jobs:
             mkdir -p bin
             gcc -O2 -Wall -o bin/nfsfuse nfsfuse.c \
               -static \
+              -DNFSFUSE_VERSION="\"$VERSION\"" \
+              -DNFSFUSE_BUILD="\"$BUILD\"" \
+              -DNFSFUSE_LIBNFS_VERSION="\"$LIBNFS_TAG\"" \
+              -DNFSFUSE_BUILD_DATE="\"$BUILD_DATE\"" \
+              -DNFSFUSE_BUILD_HOST="\"github-actions\"" \
               $(pkg-config --cflags fuse3 libnfs) \
               $(pkg-config --libs --static fuse3 libnfs) \
               -lpthread
@@ -62,6 +87,7 @@ jobs:
         run: |
           file bin/nfsfuse
           ls -lh bin/nfsfuse
+          bin/nfsfuse --version
 
       - name: Commit binary to repo
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'

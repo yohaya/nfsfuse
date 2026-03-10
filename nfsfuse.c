@@ -1,5 +1,21 @@
 #define FUSE_USE_VERSION 31
 
+#ifndef NFSFUSE_VERSION
+#define NFSFUSE_VERSION "0.0.0"
+#endif
+#ifndef NFSFUSE_BUILD
+#define NFSFUSE_BUILD "0"
+#endif
+#ifndef NFSFUSE_LIBNFS_VERSION
+#define NFSFUSE_LIBNFS_VERSION "unknown"
+#endif
+#ifndef NFSFUSE_BUILD_DATE
+#define NFSFUSE_BUILD_DATE "unknown"
+#endif
+#ifndef NFSFUSE_BUILD_HOST
+#define NFSFUSE_BUILD_HOST "unknown"
+#endif
+
 #include <fuse3/fuse.h>
 #include <nfsc/libnfs.h>
 
@@ -307,32 +323,32 @@ static struct nfs_context *mount_new_context(const char *url)
     struct nfs_context *ctx = NULL;
     struct nfs_url *nurl = NULL;
 
-    fprintf(stderr, "  nfs_init_context...\n");
+    DBG("  nfs_init_context...\n");
     ctx = nfs_init_context();
     if (ctx == NULL)
         return NULL;
 
-    fprintf(stderr, "  nfs_parse_url_dir...\n");
+    DBG("  nfs_parse_url_dir...\n");
     nurl = nfs_parse_url_dir(ctx, url);
     if (nurl == NULL) {
-        fprintf(stderr, "  parse failed: %s\n", nfs_get_error(ctx));
+        fprintf(stderr, "nfsfuse: url parse failed: %s\n", nfs_get_error(ctx));
         nfs_destroy_context(ctx);
         return NULL;
     }
 
-    fprintf(stderr, "  server=%s path=%s\n",
-            nurl->server ? nurl->server : "(null)",
-            nurl->path ? nurl->path : "(null)");
+    DBG("  server=%s path=%s\n",
+        nurl->server ? nurl->server : "(null)",
+        nurl->path ? nurl->path : "(null)");
 
-    fprintf(stderr, "  nfs_mount...\n");
+    DBG("  nfs_mount...\n");
     if (nfs_mount(ctx, nurl->server, nurl->path) != 0) {
-        fprintf(stderr, "  mount failed: %s\n", nfs_get_error(ctx));
+        fprintf(stderr, "nfsfuse: mount failed: %s\n", nfs_get_error(ctx));
         nfs_destroy_url(nurl);
         nfs_destroy_context(ctx);
         return NULL;
     }
 
-    fprintf(stderr, "  mount ok\n");
+    DBG("  mount ok\n");
     nfs_destroy_url(nurl);
     return ctx;
 }
@@ -1163,17 +1179,32 @@ static struct fuse_operations nfuse_ops = {
     .statfs     = nfuse_statfs,
 };
 
+static int g_debug = 0;
+
+#define DBG(...) do { if (g_debug) fprintf(stderr, __VA_ARGS__); } while (0)
+
+static void print_version(void)
+{
+    fprintf(stderr, "nfsfuse %s (build %s)\n", NFSFUSE_VERSION, NFSFUSE_BUILD);
+    fprintf(stderr, "  libnfs: %s\n", NFSFUSE_LIBNFS_VERSION);
+    fprintf(stderr, "  built:  %s on %s\n", NFSFUSE_BUILD_DATE, NFSFUSE_BUILD_HOST);
+}
+
 static void usage(const char *prog)
 {
+    print_version();
     fprintf(stderr,
-        "Usage:\n"
-        "  %s [--max] nfs://server/export/path[?version=3|4] <mountpoint> [FUSE options]\n\n"
+        "\nUsage:\n"
+        "  %s [--max] [--debug] nfs://server/export/path[?version=3|4] <mountpoint> [FUSE options]\n\n"
+        "Options:\n"
+        "  --max      Enable performance optimizations\n"
+        "  --debug    Print debug tracing to stderr\n"
+        "  --version  Show version information\n\n"
         "Examples:\n"
         "  %s 'nfs://192.168.52.200/store001/cdimage?version=3' /mnt/nfs\n"
         "  %s --max 'nfs://192.168.52.200/store001/cdimage?version=4' /mnt/nfs\n"
-        "  %s 'nfs://192.168.52.200/store001/cdimage?version=4' /mnt/nfs --max\n"
-        "  %s --max 'nfs://192.168.52.200/store001/cdimage?version=4' /mnt/nfs -f -d\n",
-        prog, prog, prog, prog, prog);
+        "  %s --debug 'nfs://192.168.52.200/store001/cdimage?version=4' /mnt/nfs\n",
+        prog, prog, prog, prog);
 }
 
 static int add_fuse_arg(char ***argvp, int *argcp, const char *arg)
@@ -1279,12 +1310,20 @@ int main(int argc, char *argv[])
             usage(argv[0]);
             return 0;
         }
+        if (strcmp(argv[i], "--version") == 0) {
+            print_version();
+            return 0;
+        }
+        if (strcmp(argv[i], "--debug") == 0)
+            g_debug = 1;
     }
 
     if (argc < 3) {
         usage(argv[0]);
         return 1;
     }
+
+    print_version();
 
     if (pthread_mutex_init(&g_state.meta_lock, NULL) != 0) {
         fprintf(stderr, "pthread_mutex_init failed\n");
@@ -1298,6 +1337,8 @@ int main(int argc, char *argv[])
             g_state.max_mode = 1;
             continue;
         }
+        if (strcmp(argv[i], "--debug") == 0)
+            continue;
 
         if (url_idx == -1) {
             url_idx = i;
@@ -1330,18 +1371,18 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    fprintf(stderr, "nfsfuse: url=%s v4=%d max=%d\n",
-            g_state.url_effective, g_state.safe_v4_mode, g_state.max_mode);
+    DBG("nfsfuse: url=%s v4=%d max=%d\n",
+        g_state.url_effective, g_state.safe_v4_mode, g_state.max_mode);
 
     g_state.fsname = build_fsname_from_url(g_state.url_base);
     if (g_state.fsname == NULL)
         g_state.fsname = xstrdup("nfsfuse");
 
-    fprintf(stderr, "nfsfuse: mounting...\n");
+    DBG("nfsfuse: mounting...\n");
 
     g_state.meta_nfs = mount_new_context(g_state.url_effective);
     if (g_state.meta_nfs == NULL) {
-        fprintf(stderr, "nfs mount failed for %s\n", g_state.url_effective);
+        fprintf(stderr, "nfsfuse: mount failed for %s\n", g_state.url_effective);
         cleanup_app_state();
         return 1;
     }
@@ -1349,7 +1390,7 @@ int main(int argc, char *argv[])
     readmax = nfs_get_readmax(g_state.meta_nfs);
     writemax = nfs_get_writemax(g_state.meta_nfs);
 
-    fprintf(stderr, "nfsfuse: mounted, readmax=%zu writemax=%zu\n", readmax, writemax);
+    DBG("nfsfuse: mounted, readmax=%zu writemax=%zu\n", readmax, writemax);
 
     if (g_state.max_mode) {
         g_state.io_chunk = NFUSE_MAX_IO_CHUNK;
@@ -1393,7 +1434,7 @@ int main(int argc, char *argv[])
     for (i = 1; i < argc; i++) {
         if (i == url_idx || i == mount_idx)
             continue;
-        if (strcmp(argv[i], "--max") == 0)
+        if (strcmp(argv[i], "--max") == 0 || strcmp(argv[i], "--debug") == 0)
             continue;
 
         if (add_fuse_arg(&fuse_argv, &fuse_argc, argv[i]) != 0) {
@@ -1409,9 +1450,9 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    fprintf(stderr, "nfsfuse: starting fuse (argc=%d)\n", fuse_argc);
-    for (i = 0; i < fuse_argc; i++)
-        fprintf(stderr, "  argv[%d]=%s\n", i, fuse_argv[i]);
+    DBG("nfsfuse: starting fuse (argc=%d)\n", fuse_argc);
+    for (i = 0; i < fuse_argc && g_debug; i++)
+        DBG("  argv[%d]=%s\n", i, fuse_argv[i]);
 
     rc = fuse_main(fuse_argc, fuse_argv, &nfuse_ops, NULL);
 
