@@ -46,23 +46,24 @@ jobs:
             # Compile nfsfuse as fully static binary
             cd /src
             export PKG_CONFIG_PATH=/usr/lib/pkgconfig:/usr/lib64/pkgconfig
-            gcc -O2 -Wall -o nfsfuse nfsfuse.c \
+            mkdir -p bin
+            gcc -O2 -Wall -o bin/nfsfuse nfsfuse.c \
               -static \
               $(pkg-config --cflags fuse3 libnfs) \
               $(pkg-config --libs --static fuse3 libnfs) \
               -lpthread
-            strip nfsfuse
+            strip bin/nfsfuse
           '
 
       - name: Show binary info
         run: |
-          file nfsfuse
-          ls -lh nfsfuse
+          file bin/nfsfuse
+          ls -lh bin/nfsfuse
 
       - uses: actions/upload-artifact@v4
         with:
-          name: nfsfuse-linux-amd64
-          path: nfsfuse
+          name: nfsfuse
+          path: bin/nfsfuse
 
   release:
     needs: build
@@ -73,7 +74,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: nfsfuse-linux-amd64
+          name: nfsfuse
 
       - name: Create release
         uses: softprops/action-gh-release@v2
