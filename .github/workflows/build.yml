@@ -1,0 +1,82 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build static binary in Alpine container
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:latest sh -exc '
+            apk add --no-cache \
+              gcc musl-dev make cmake git meson ninja pkgconf linux-headers
+
+            # Build latest libnfs as static library
+            git clone --depth 1 https://github.com/sahlberg/libnfs.git /tmp/libnfs
+            cd /tmp/libnfs
+            mkdir build && cd build
+            cmake .. \
+              -DCMAKE_INSTALL_PREFIX=/usr \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS=OFF
+            make -j$(nproc)
+            make install
+
+            # Build libfuse3 as static library
+            git clone --depth 1 https://github.com/libfuse/libfuse.git /tmp/libfuse
+            cd /tmp/libfuse
+            mkdir build && cd build
+            meson setup .. \
+              --default-library=static \
+              --prefix=/usr \
+              -Dexamples=false \
+              -Dutils=false
+            ninja
+            ninja install
+
+            # Compile nfsfuse as fully static binary
+            cd /src
+            export PKG_CONFIG_PATH=/usr/lib/pkgconfig:/usr/lib64/pkgconfig
+            gcc -O2 -Wall -o nfsfuse nfsfuse.c \
+              -static \
+              $(pkg-config --cflags fuse3 libnfs) \
+              $(pkg-config --libs --static fuse3 libnfs) \
+              -lpthread
+            strip nfsfuse
+          '
+
+      - name: Show binary info
+        run: |
+          file nfsfuse
+          ls -lh nfsfuse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nfsfuse-linux-amd64
+          path: nfsfuse
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nfsfuse-linux-amd64
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: nfsfuse
+          generate_release_notes: true
