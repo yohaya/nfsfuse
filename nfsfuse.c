@@ -1080,22 +1080,19 @@ static int nfuse_rename(const char *from, const char *to, unsigned int flags)
 
 static int nfuse_readlink(const char *path, char *buf, size_t size)
 {
-    char *target = NULL;
     int rc;
 
     if (path == NULL || buf == NULL || size == 0)
         return -EINVAL;
 
     pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_readlink(g_state.meta_nfs, path, &target);
+    rc = nfs_readlink(g_state.meta_nfs, path, buf, (int)size);
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc < 0)
         return nfs_err(rc);
 
-    strncpy(buf, target, size - 1);
     buf[size - 1] = '\0';
-    free(target);
     return 0;
 }
 
