@@ -73,6 +73,7 @@ static int g_log_errors = 0;
 static int g_syslog_open = 0;
 static int g_noatime = 0;
 static int g_nodiratime = 0;
+static int g_noexec = 0;
 
 #define DBG(...) do { if (g_debug) fprintf(stderr, __VA_ARGS__); } while (0)
 
@@ -1451,6 +1452,7 @@ static void usage(const char *prog)
         "  --log-errors         Log NFS errors to syslog (daemon facility)\n"
         "  --noatime            Do not update access time on read\n"
         "  --nodiratime         Do not update directory access time\n"
+        "  --noexec             Disallow execution of binaries on mount\n"
         "  --version            Show version information\n\n"
         "Timeout and retry options:\n"
         "  --timeout <ms>       RPC request timeout in milliseconds (default: 10000)\n"
@@ -1534,6 +1536,7 @@ static int is_nfsfuse_opt(const char *arg)
            strcmp(arg, "--log-errors") == 0 ||
            strcmp(arg, "--noatime") == 0 ||
            strcmp(arg, "--nodiratime") == 0 ||
+           strcmp(arg, "--noexec") == 0 ||
            strcmp(arg, "--timeout") == 0 ||
            strcmp(arg, "--retrans") == 0 ||
            strcmp(arg, "--autoreconnect") == 0 ||
@@ -1603,6 +1606,8 @@ int main(int argc, char *argv[])
             g_noatime = 1;
         if (strcmp(argv[i], "--nodiratime") == 0)
             g_nodiratime = 1;
+        if (strcmp(argv[i], "--noexec") == 0)
+            g_noexec = 1;
         if (is_nfsfuse_opt_with_value(argv[i]) && i + 1 < argc)
             i++;
     }
@@ -1639,6 +1644,8 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--noatime") == 0)
             continue;
         if (strcmp(argv[i], "--nodiratime") == 0)
+            continue;
+        if (strcmp(argv[i], "--noexec") == 0)
             continue;
 
         if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
@@ -1762,6 +1769,15 @@ int main(int argc, char *argv[])
     if (g_nodiratime) {
         if (add_fuse_arg(&fuse_argv, &fuse_argc, "-o") != 0 ||
             add_fuse_arg(&fuse_argv, &fuse_argc, "nodiratime") != 0) {
+            free_fuse_args(fuse_argv, fuse_argc);
+            cleanup_app_state();
+            return 1;
+        }
+    }
+
+    if (g_noexec) {
+        if (add_fuse_arg(&fuse_argv, &fuse_argc, "-o") != 0 ||
+            add_fuse_arg(&fuse_argv, &fuse_argc, "noexec") != 0) {
             free_fuse_args(fuse_argv, fuse_argc);
             cleanup_app_state();
             return 1;

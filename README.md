@@ -34,6 +34,7 @@ nfsfuse [--max] [--debug] nfs://server/export/path[?version=3|4] <mountpoint> [F
 | `--log-errors` | Log NFS errors to syslog (daemon facility) |
 | `--noatime` | Do not update access time on read |
 | `--nodiratime` | Do not update directory access time |
+| `--noexec` | Disallow execution of binaries on mount |
 | `--version`| Show version, libnfs version, and build info |
 | `-f` | Run in foreground (FUSE option) |
 | `-d` | Enable FUSE debug output (FUSE option) |
