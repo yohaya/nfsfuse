@@ -36,6 +36,18 @@ nfsfuse [--max] [--debug] nfs://server/export/path[?version=3|4] <mountpoint> [F
 | `-d` | Enable FUSE debug output (FUSE option) |
 | `-s` | Force single-threaded mode (FUSE option) |
 
+### Timeout and retry options
+
+These control how nfsfuse handles slow or unreliable NFS servers:
+
+| Option | Description |
+|---|---|
+| `--timeout <ms>` | RPC request timeout in milliseconds (default: 10000). How long to wait for the server to respond to each NFS operation. |
+| `--retrans <n>` | Number of RPC retransmission attempts before a major timeout (default: 0). Each retry uses the `--timeout` value. |
+| `--autoreconnect <n>` | Number of TCP reconnection attempts if the connection drops (default: 0). Set to `-1` for infinite retries. |
+| `--tcp-syncnt <n>` | TCP SYN retry count for initial connection establishment. Controls how many times the TCP handshake is retried. |
+| `--poll-timeout <ms>` | Poll interval in milliseconds between checking for server responses. |
+
 ### Examples
 
 Mount an NFSv3 export:
@@ -51,6 +63,16 @@ nfsfuse 'nfs://192.168.1.100/export/data?version=4' /mnt/nfs
 Mount with performance optimizations:
 ```bash
 nfsfuse --max 'nfs://192.168.1.100/export/data?version=3' /mnt/nfs
+```
+
+Mount with 30-second timeout and infinite reconnect (resilient to server restarts):
+```bash
+nfsfuse --timeout 30000 --autoreconnect -1 'nfs://10.0.0.1/data' /mnt/nfs
+```
+
+Mount with retries for unreliable networks:
+```bash
+nfsfuse --retrans 5 --tcp-syncnt 3 --timeout 15000 'nfs://10.0.0.1/data' /mnt/nfs
 ```
 
 Debug a connection:

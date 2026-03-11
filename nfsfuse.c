@@ -89,6 +89,18 @@ struct app_state {
     struct nfs_context *meta_nfs;
     pthread_mutex_t meta_lock;
     int meta_lock_init;
+
+    int timeout;
+    int retrans;
+    int autoreconnect;
+    int tcp_syncnt;
+    int poll_timeout;
+
+    int has_timeout;
+    int has_retrans;
+    int has_autoreconnect;
+    int has_tcp_syncnt;
+    int has_poll_timeout;
 };
 
 struct file_handle {
@@ -330,6 +342,30 @@ static char *build_fsname_from_url(const char *url)
     return out;
 }
 
+static void apply_nfs_tuning(struct nfs_context *ctx)
+{
+    if (g_state.has_timeout) {
+        nfs_set_timeout(ctx, g_state.timeout);
+        DBG("  timeout=%dms\n", g_state.timeout);
+    }
+    if (g_state.has_retrans) {
+        nfs_set_retrans(ctx, g_state.retrans);
+        DBG("  retrans=%d\n", g_state.retrans);
+    }
+    if (g_state.has_autoreconnect) {
+        nfs_set_autoreconnect(ctx, g_state.autoreconnect);
+        DBG("  autoreconnect=%d\n", g_state.autoreconnect);
+    }
+    if (g_state.has_tcp_syncnt) {
+        nfs_set_tcp_syncnt(ctx, g_state.tcp_syncnt);
+        DBG("  tcp_syncnt=%d\n", g_state.tcp_syncnt);
+    }
+    if (g_state.has_poll_timeout) {
+        nfs_set_poll_timeout(ctx, g_state.poll_timeout);
+        DBG("  poll_timeout=%dms\n", g_state.poll_timeout);
+    }
+}
+
 static struct nfs_context *mount_new_context(const char *url)
 {
     struct nfs_context *ctx = NULL;
@@ -339,6 +375,8 @@ static struct nfs_context *mount_new_context(const char *url)
     ctx = nfs_init_context();
     if (ctx == NULL)
         return NULL;
+
+    apply_nfs_tuning(ctx);
 
     DBG("  nfs_parse_url_dir...\n");
     nurl = nfs_parse_url_dir(ctx, url);
@@ -1368,15 +1406,21 @@ static void usage(const char *prog)
     fprintf(stderr, "nfsfuse %s\n", NFSFUSE_VERSION);
     fprintf(stderr,
         "\nUsage:\n"
-        "  %s [--max] [--debug] nfs://server/export/path[?version=3|4] <mountpoint> [FUSE options]\n\n"
+        "  %s [options] nfs://server/export/path[?version=3|4] <mountpoint> [FUSE options]\n\n"
         "Options:\n"
-        "  --max      Enable performance optimizations\n"
-        "  --debug    Print debug tracing to stderr\n"
-        "  --version  Show version information\n\n"
+        "  --max                Enable performance optimizations\n"
+        "  --debug              Print debug tracing to stderr\n"
+        "  --version            Show version information\n\n"
+        "Timeout and retry options:\n"
+        "  --timeout <ms>       RPC request timeout in milliseconds (default: 10000)\n"
+        "  --retrans <n>        RPC retransmission attempts before major timeout (default: 0)\n"
+        "  --autoreconnect <n>  TCP reconnect attempts on disconnect (-1=infinite, default: 0)\n"
+        "  --tcp-syncnt <n>     TCP SYN retry count for connection establishment\n"
+        "  --poll-timeout <ms>  Poll interval in milliseconds between response checks\n\n"
         "Examples:\n"
         "  %s 'nfs://192.168.52.200/store001/cdimage?version=3' /mnt/nfs\n"
-        "  %s --max 'nfs://192.168.52.200/store001/cdimage?version=4' /mnt/nfs\n"
-        "  %s --debug 'nfs://192.168.52.200/store001/cdimage?version=4' /mnt/nfs\n",
+        "  %s --timeout 30000 --autoreconnect -1 'nfs://10.0.0.1/data' /mnt/nfs\n"
+        "  %s --retrans 5 --tcp-syncnt 3 'nfs://10.0.0.1/data?version=4' /mnt/nfs\n",
         prog, prog, prog, prog);
 }
 
@@ -1442,6 +1486,26 @@ static int append_max_mount_options(char ***argvp, int *argcp)
     return 0;
 }
 
+static int is_nfsfuse_opt(const char *arg)
+{
+    return strcmp(arg, "--max") == 0 ||
+           strcmp(arg, "--debug") == 0 ||
+           strcmp(arg, "--timeout") == 0 ||
+           strcmp(arg, "--retrans") == 0 ||
+           strcmp(arg, "--autoreconnect") == 0 ||
+           strcmp(arg, "--tcp-syncnt") == 0 ||
+           strcmp(arg, "--poll-timeout") == 0;
+}
+
+static int is_nfsfuse_opt_with_value(const char *arg)
+{
+    return strcmp(arg, "--timeout") == 0 ||
+           strcmp(arg, "--retrans") == 0 ||
+           strcmp(arg, "--autoreconnect") == 0 ||
+           strcmp(arg, "--tcp-syncnt") == 0 ||
+           strcmp(arg, "--poll-timeout") == 0;
+}
+
 static int user_passed_single_thread(int argc, char *argv[])
 {
     int i;
@@ -1489,6 +1553,8 @@ int main(int argc, char *argv[])
         }
         if (strcmp(argv[i], "--debug") == 0)
             g_debug = 1;
+        if (is_nfsfuse_opt_with_value(argv[i]) && i + 1 < argc)
+            i++;
     }
 
     if (argc < 3) {
@@ -1513,6 +1579,32 @@ int main(int argc, char *argv[])
         }
         if (strcmp(argv[i], "--debug") == 0)
             continue;
+
+        if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
+            g_state.timeout = atoi(argv[++i]);
+            g_state.has_timeout = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--retrans") == 0 && i + 1 < argc) {
+            g_state.retrans = atoi(argv[++i]);
+            g_state.has_retrans = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--autoreconnect") == 0 && i + 1 < argc) {
+            g_state.autoreconnect = atoi(argv[++i]);
+            g_state.has_autoreconnect = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--tcp-syncnt") == 0 && i + 1 < argc) {
+            g_state.tcp_syncnt = atoi(argv[++i]);
+            g_state.has_tcp_syncnt = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--poll-timeout") == 0 && i + 1 < argc) {
+            g_state.poll_timeout = atoi(argv[++i]);
+            g_state.has_poll_timeout = 1;
+            continue;
+        }
 
         if (url_idx == -1) {
             url_idx = i;
@@ -1608,8 +1700,11 @@ int main(int argc, char *argv[])
     for (i = 1; i < argc; i++) {
         if (i == url_idx || i == mount_idx)
             continue;
-        if (strcmp(argv[i], "--max") == 0 || strcmp(argv[i], "--debug") == 0)
+        if (is_nfsfuse_opt(argv[i])) {
+            if (is_nfsfuse_opt_with_value(argv[i]))
+                i++;
             continue;
+        }
 
         if (add_fuse_arg(&fuse_argv, &fuse_argc, argv[i]) != 0) {
             free_fuse_args(fuse_argv, fuse_argc);
