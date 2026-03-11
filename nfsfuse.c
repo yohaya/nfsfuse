@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
+#include <syslog.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -68,8 +69,30 @@
 #endif
 
 static int g_debug = 0;
+static int g_log_errors = 0;
+static int g_syslog_open = 0;
 
 #define DBG(...) do { if (g_debug) fprintf(stderr, __VA_ARGS__); } while (0)
+
+static void log_nfs_error(const char *op, const char *path,
+                          int rc, struct nfs_context *ctx)
+{
+    const char *nfs_msg;
+    int priority;
+
+    if (!g_log_errors)
+        return;
+
+    nfs_msg = ctx ? nfs_get_error(ctx) : NULL;
+    if (nfs_msg == NULL || nfs_msg[0] == '\0')
+        nfs_msg = "unknown error";
+
+    priority = (rc == -ETIMEDOUT) ? LOG_WARNING : LOG_ERR;
+
+    syslog(priority, "%s %s: %s (rc=%d/%s)",
+           op, path ? path : "",
+           nfs_msg, rc, strerror(-rc));
+}
 
 static void print_version(void)
 {
@@ -135,6 +158,15 @@ static int nfs_err(int rc)
     if (rc < 0)
         return rc;
     return -EIO;
+}
+
+static int nfs_err_log(int rc, const char *op, const char *path,
+                       struct nfs_context *ctx)
+{
+    int err = nfs_err(rc);
+
+    log_nfs_error(op, path, err, ctx);
+    return err;
 }
 
 static char *xstrdup(const char *s)
@@ -534,6 +566,7 @@ static int open_file_handle_common(const char *path, int flags, mode_t mode,
     }
 
     if (rc < 0) {
+        log_nfs_error("open", path, nfs_err(rc), ctx);
         if (use_private_ctx)
             destroy_nfs_context_safe(ctx);
         return nfs_err(rc);
@@ -595,6 +628,7 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
         rc = CALL_NFS_PREAD(h->ctx, h->fh, offset + (off_t)done, chunk, buf + done);
         if (rc < 0) {
             if (done == 0) {
+                log_nfs_error("read", NULL, nfs_err(rc), h->ctx);
                 file_handle_unlock(h);
                 return nfs_err(rc);
             }
@@ -630,6 +664,7 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
         rc = CALL_NFS_PWRITE(h->ctx, h->fh, offset + (off_t)done, chunk, buf + done);
         if (rc < 0) {
             if (done == 0) {
+                log_nfs_error("write", NULL, nfs_err(rc), h->ctx);
                 file_handle_unlock(h);
                 return nfs_err(rc);
             }
@@ -751,7 +786,7 @@ static int nfuse_getattr(const char *path, struct stat *stbuf, struct fuse_file_
     }
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "getattr", path, g_state.meta_nfs);
 
     fill_stat_from_nfs64(stbuf, &st);
     return 0;
@@ -778,6 +813,7 @@ static int nfuse_opendir(const char *path, struct fuse_file_info *fi)
 
         rc = nfs_opendir(ctx, path, &dir);
         if (rc < 0) {
+            log_nfs_error("opendir", path, nfs_err(rc), ctx);
             destroy_nfs_context_safe(ctx);
             free(h);
             return nfs_err(rc);
@@ -792,7 +828,7 @@ static int nfuse_opendir(const char *path, struct fuse_file_info *fi)
 
         if (rc < 0) {
             free(h);
-            return nfs_err(rc);
+            return nfs_err_log(rc, "opendir", path, g_state.meta_nfs);
         }
 
         h->ctx = g_state.meta_nfs;
@@ -1017,7 +1053,7 @@ static int nfuse_truncate(const char *path, off_t size, struct fuse_file_info *f
     }
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "truncate", path, g_state.meta_nfs);
 
     return 0;
 }
@@ -1050,7 +1086,7 @@ static int nfuse_utimens(const char *path, const struct timespec tv[2],
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "utimens", path, g_state.meta_nfs);
 
     return 0;
 }
@@ -1064,7 +1100,7 @@ static int nfuse_unlink(const char *path)
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "unlink", path, g_state.meta_nfs);
 
     return 0;
 }
@@ -1080,7 +1116,7 @@ static int nfuse_mkdir(const char *path, mode_t mode)
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "mkdir", path, g_state.meta_nfs);
 
     return 0;
 }
@@ -1094,7 +1130,7 @@ static int nfuse_rmdir(const char *path)
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "rmdir", path, g_state.meta_nfs);
 
     return 0;
 }
@@ -1111,7 +1147,7 @@ static int nfuse_rename(const char *from, const char *to, unsigned int flags)
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "rename", from, g_state.meta_nfs);
 
     return 0;
 }
@@ -1128,7 +1164,7 @@ static int nfuse_readlink(const char *path, char *buf, size_t size)
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "readlink", path, g_state.meta_nfs);
 
     buf[size - 1] = '\0';
     return 0;
@@ -1143,7 +1179,7 @@ static int nfuse_symlink(const char *target, const char *linkpath)
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "symlink", linkpath, g_state.meta_nfs);
 
     return 0;
 }
@@ -1157,7 +1193,7 @@ static int nfuse_link(const char *oldpath, const char *newpath)
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "link", newpath, g_state.meta_nfs);
 
     return 0;
 }
@@ -1182,7 +1218,7 @@ static int nfuse_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
     }
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "chmod", path, g_state.meta_nfs);
 
     return 0;
 }
@@ -1208,7 +1244,7 @@ static int nfuse_chown(const char *path, uid_t uid, gid_t gid,
     }
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "chown", path, g_state.meta_nfs);
 
     return 0;
 }
@@ -1222,7 +1258,7 @@ static int nfuse_mknod(const char *path, mode_t mode, dev_t rdev)
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "mknod", path, g_state.meta_nfs);
 
     return 0;
 }
@@ -1236,7 +1272,7 @@ static int nfuse_access(const char *path, int mask)
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "access", path, g_state.meta_nfs);
 
     return 0;
 }
@@ -1266,7 +1302,7 @@ static int nfuse_fsync(const char *path, int datasync, struct fuse_file_info *fi
     file_handle_unlock(h);
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "fsync", path, h->ctx);
 
     return 0;
 }
@@ -1284,7 +1320,7 @@ static int nfuse_statfs(const char *path, struct statvfs *st)
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc < 0)
-        return nfs_err(rc);
+        return nfs_err_log(rc, "statfs", "/", g_state.meta_nfs);
 
     return 0;
 }
@@ -1410,6 +1446,7 @@ static void usage(const char *prog)
         "Options:\n"
         "  --max                Enable performance optimizations\n"
         "  --debug              Print debug tracing to stderr\n"
+        "  --log-errors         Log NFS errors to syslog (daemon facility)\n"
         "  --version            Show version information\n\n"
         "Timeout and retry options:\n"
         "  --timeout <ms>       RPC request timeout in milliseconds (default: 10000)\n"
@@ -1490,6 +1527,7 @@ static int is_nfsfuse_opt(const char *arg)
 {
     return strcmp(arg, "--max") == 0 ||
            strcmp(arg, "--debug") == 0 ||
+           strcmp(arg, "--log-errors") == 0 ||
            strcmp(arg, "--timeout") == 0 ||
            strcmp(arg, "--retrans") == 0 ||
            strcmp(arg, "--autoreconnect") == 0 ||
@@ -1553,6 +1591,8 @@ int main(int argc, char *argv[])
         }
         if (strcmp(argv[i], "--debug") == 0)
             g_debug = 1;
+        if (strcmp(argv[i], "--log-errors") == 0)
+            g_log_errors = 1;
         if (is_nfsfuse_opt_with_value(argv[i]) && i + 1 < argc)
             i++;
     }
@@ -1564,6 +1604,11 @@ int main(int argc, char *argv[])
 
     if (g_debug)
         print_version();
+
+    if (g_log_errors) {
+        openlog("nfsfuse", LOG_PID, LOG_DAEMON);
+        g_syslog_open = 1;
+    }
 
     if (pthread_mutex_init(&g_state.meta_lock, NULL) != 0) {
         fprintf(stderr, "pthread_mutex_init failed\n");
@@ -1578,6 +1623,8 @@ int main(int argc, char *argv[])
             continue;
         }
         if (strcmp(argv[i], "--debug") == 0)
+            continue;
+        if (strcmp(argv[i], "--log-errors") == 0)
             continue;
 
         if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
@@ -1738,6 +1785,9 @@ int main(int argc, char *argv[])
     if (g_state.meta_nfs != NULL || g_state.url_base != NULL ||
         g_state.url_effective != NULL || g_state.fsname != NULL)
         cleanup_app_state();
+
+    if (g_syslog_open)
+        closelog();
 
     return rc;
 }

@@ -31,6 +31,7 @@ nfsfuse [--max] [--debug] nfs://server/export/path[?version=3|4] <mountpoint> [F
 |-----------|----------------------------------------------|
 | `--max` | Enable performance optimizations |
 | `--debug` | Print version info and debug tracing to stderr |
+| `--log-errors` | Log NFS errors to syslog (daemon facility) |
 | `--version`| Show version, libnfs version, and build info |
 | `-f` | Run in foreground (FUSE option) |
 | `-d` | Enable FUSE debug output (FUSE option) |
@@ -75,6 +76,11 @@ Mount with retries for unreliable networks:
 nfsfuse --retrans 5 --tcp-syncnt 3 --timeout 15000 'nfs://10.0.0.1/data' /mnt/nfs
 ```
 
+Enable syslog error logging:
+```bash
+nfsfuse --log-errors 'nfs://192.168.1.100/export/data?version=3' /mnt/nfs
+```
+
 Debug a connection:
 ```bash
 nfsfuse --debug 'nfs://192.168.1.100/export/data?version=4' /mnt/nfs
@@ -107,6 +113,24 @@ Without `--max`, a single shared NFS connection is used with conservative cachin
 - NFSv4 automatically forces single-threaded FUSE operation (`-s`) because libnfs NFS contexts are not thread-safe
 - Directory caching is disabled for NFSv4 to avoid stale data
 - When using `--max` with NFSv4, per-file connections are used but kernel caching remains disabled
+
+## Error logging (`--log-errors`)
+
+When `--log-errors` is enabled, all NFS operation failures are logged to syslog under the `daemon` facility with the `nfsfuse` identifier. Each log entry includes:
+
+- The operation that failed (e.g., `read`, `write`, `getattr`, `open`)
+- The file path involved
+- The NFS server error message from libnfs
+- The error code and its human-readable description
+
+Timeout errors are logged at `WARNING` priority; all other errors at `ERR` priority.
+
+View logs with:
+```bash
+grep nfsfuse /var/log/syslog
+# or
+journalctl -t nfsfuse
+```
 
 ## Requirements
 
