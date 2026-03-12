@@ -172,6 +172,8 @@ static int nfs_err_log(int rc, const char *op, const char *path,
     return err;
 }
 
+static struct nfs_context *mount_new_context(const char *url);
+
 static int is_nfs4_expired(int rc)
 {
     return g_state.safe_v4_mode && rc == -ERANGE;
