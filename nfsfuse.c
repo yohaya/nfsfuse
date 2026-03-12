@@ -172,6 +172,62 @@ static int nfs_err_log(int rc, const char *op, const char *path,
     return err;
 }
 
+static int is_nfs4_expired(int rc)
+{
+    return g_state.safe_v4_mode && rc == -ERANGE;
+}
+
+static int reconnect_meta_context(const char *op, const char *path)
+{
+    struct nfs_context *new_ctx;
+
+    DBG("nfsfuse: NFS4ERR_EXPIRED on %s %s — reconnecting\n",
+        op, path ? path : "");
+
+    if (g_log_errors)
+        syslog(LOG_WARNING, "NFS4ERR_EXPIRED on %s %s — reconnecting",
+               op, path ? path : "");
+
+    new_ctx = mount_new_context(g_state.url_effective);
+    if (new_ctx == NULL) {
+        DBG("nfsfuse: reconnect failed\n");
+        if (g_log_errors)
+            syslog(LOG_ERR, "reconnect failed after NFS4ERR_EXPIRED on %s %s",
+                   op, path ? path : "");
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    /* Do not destroy old context — open file handles still reference it.
+     * Those handles will get NFS errors and the application will reopen. */
+    g_state.meta_nfs = new_ctx;
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    DBG("nfsfuse: reconnected successfully\n");
+    if (g_log_errors)
+        syslog(LOG_NOTICE, "reconnected after NFS4ERR_EXPIRED, retrying %s %s",
+               op, path ? path : "");
+
+    return 0;
+}
+
+/*
+ * Lock meta, execute NFS call, unlock. On NFS4ERR_EXPIRED, reconnect
+ * and retry once. The 'call' expression is evaluated twice on retry
+ * and must use g_state.meta_nfs (which is updated by reconnect).
+ */
+#define META_RETRY(rc, op, path, call) do {                     \
+    pthread_mutex_lock(&g_state.meta_lock);                     \
+    (rc) = (call);                                              \
+    pthread_mutex_unlock(&g_state.meta_lock);                   \
+    if ((rc) < 0 && is_nfs4_expired(rc) &&                      \
+        reconnect_meta_context((op), (path)) == 0) {            \
+        pthread_mutex_lock(&g_state.meta_lock);                 \
+        (rc) = (call);                                          \
+        pthread_mutex_unlock(&g_state.meta_lock);               \
+    }                                                           \
+} while (0)
+
 static char *xstrdup(const char *s)
 {
     if (s == NULL)
@@ -783,9 +839,8 @@ static int nfuse_getattr(const char *path, struct stat *stbuf, struct fuse_file_
         if (path == NULL)
             return -EINVAL;
 
-        pthread_mutex_lock(&g_state.meta_lock);
-        rc = nfs_lstat64(g_state.meta_nfs, path, &st);
-        pthread_mutex_unlock(&g_state.meta_lock);
+        META_RETRY(rc, "getattr", path,
+            nfs_lstat64(g_state.meta_nfs, path, &st));
     }
 
     if (rc < 0)
@@ -825,9 +880,8 @@ static int nfuse_opendir(const char *path, struct fuse_file_info *fi)
         h->ctx = ctx;
         h->own_ctx = 1;
     } else {
-        pthread_mutex_lock(&g_state.meta_lock);
-        rc = nfs_opendir(g_state.meta_nfs, path, &dir);
-        pthread_mutex_unlock(&g_state.meta_lock);
+        META_RETRY(rc, "opendir", path,
+            nfs_opendir(g_state.meta_nfs, path, &dir));
 
         if (rc < 0) {
             free(h);
@@ -945,6 +999,9 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
     int rc;
 
     rc = open_file_handle_common(path, flags, 0, 0, &h);
+    if (rc < 0 && is_nfs4_expired(rc) &&
+        reconnect_meta_context("open", path) == 0)
+        rc = open_file_handle_common(path, flags, 0, 0, &h);
     if (rc < 0)
         return rc;
 
@@ -970,6 +1027,9 @@ static int nfuse_create(const char *path, mode_t mode, struct fuse_file_info *fi
     int rc;
 
     rc = open_file_handle_common(path, flags, mode, 1, &h);
+    if (rc < 0 && is_nfs4_expired(rc) &&
+        reconnect_meta_context("create", path) == 0)
+        rc = open_file_handle_common(path, flags, mode, 1, &h);
     if (rc < 0)
         return rc;
 
@@ -1050,9 +1110,8 @@ static int nfuse_truncate(const char *path, off_t size, struct fuse_file_info *f
         if (path == NULL)
             return -EINVAL;
 
-        pthread_mutex_lock(&g_state.meta_lock);
-        rc = nfs_truncate(g_state.meta_nfs, path, (uint64_t)size);
-        pthread_mutex_unlock(&g_state.meta_lock);
+        META_RETRY(rc, "truncate", path,
+            nfs_truncate(g_state.meta_nfs, path, (uint64_t)size));
     }
 
     if (rc < 0)
@@ -1086,9 +1145,8 @@ static int nfuse_utimens(const char *path, const struct timespec tv[2],
         if (need_stat) {
             struct nfs_stat_64 st;
 
-            pthread_mutex_lock(&g_state.meta_lock);
-            rc = nfs_lstat64(g_state.meta_nfs, path, &st);
-            pthread_mutex_unlock(&g_state.meta_lock);
+            META_RETRY(rc, "utimens", path,
+                nfs_lstat64(g_state.meta_nfs, path, &st));
 
             if (rc < 0)
                 return nfs_err_log(rc, "utimens", path, g_state.meta_nfs);
@@ -1118,9 +1176,8 @@ static int nfuse_utimens(const char *path, const struct timespec tv[2],
         }
     }
 
-    pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_utimes(g_state.meta_nfs, path, times);
-    pthread_mutex_unlock(&g_state.meta_lock);
+    META_RETRY(rc, "utimens", path,
+        nfs_utimes(g_state.meta_nfs, path, times));
 
     if (rc < 0)
         return nfs_err_log(rc, "utimens", path, g_state.meta_nfs);
@@ -1132,9 +1189,8 @@ static int nfuse_unlink(const char *path)
 {
     int rc;
 
-    pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_unlink(g_state.meta_nfs, path);
-    pthread_mutex_unlock(&g_state.meta_lock);
+    META_RETRY(rc, "unlink", path,
+        nfs_unlink(g_state.meta_nfs, path));
 
     if (rc < 0)
         return nfs_err_log(rc, "unlink", path, g_state.meta_nfs);
@@ -1148,9 +1204,8 @@ static int nfuse_mkdir(const char *path, mode_t mode)
 
     (void)mode;
 
-    pthread_mutex_lock(&g_state.meta_lock);
-    rc = CALL_NFS_MKDIR(g_state.meta_nfs, path, mode);
-    pthread_mutex_unlock(&g_state.meta_lock);
+    META_RETRY(rc, "mkdir", path,
+        CALL_NFS_MKDIR(g_state.meta_nfs, path, mode));
 
     if (rc < 0)
         return nfs_err_log(rc, "mkdir", path, g_state.meta_nfs);
@@ -1162,9 +1217,8 @@ static int nfuse_rmdir(const char *path)
 {
     int rc;
 
-    pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_rmdir(g_state.meta_nfs, path);
-    pthread_mutex_unlock(&g_state.meta_lock);
+    META_RETRY(rc, "rmdir", path,
+        nfs_rmdir(g_state.meta_nfs, path));
 
     if (rc < 0)
         return nfs_err_log(rc, "rmdir", path, g_state.meta_nfs);
@@ -1179,9 +1233,8 @@ static int nfuse_rename(const char *from, const char *to, unsigned int flags)
     if (flags != 0)
         return -EINVAL;
 
-    pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_rename(g_state.meta_nfs, from, to);
-    pthread_mutex_unlock(&g_state.meta_lock);
+    META_RETRY(rc, "rename", from,
+        nfs_rename(g_state.meta_nfs, from, to));
 
     if (rc < 0)
         return nfs_err_log(rc, "rename", from, g_state.meta_nfs);
@@ -1196,9 +1249,8 @@ static int nfuse_readlink(const char *path, char *buf, size_t size)
     if (path == NULL || buf == NULL || size == 0)
         return -EINVAL;
 
-    pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_readlink(g_state.meta_nfs, path, buf, (int)size);
-    pthread_mutex_unlock(&g_state.meta_lock);
+    META_RETRY(rc, "readlink", path,
+        nfs_readlink(g_state.meta_nfs, path, buf, (int)size));
 
     if (rc < 0)
         return nfs_err_log(rc, "readlink", path, g_state.meta_nfs);
@@ -1211,9 +1263,8 @@ static int nfuse_symlink(const char *target, const char *linkpath)
 {
     int rc;
 
-    pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_symlink(g_state.meta_nfs, target, linkpath);
-    pthread_mutex_unlock(&g_state.meta_lock);
+    META_RETRY(rc, "symlink", linkpath,
+        nfs_symlink(g_state.meta_nfs, target, linkpath));
 
     if (rc < 0)
         return nfs_err_log(rc, "symlink", linkpath, g_state.meta_nfs);
@@ -1225,9 +1276,8 @@ static int nfuse_link(const char *oldpath, const char *newpath)
 {
     int rc;
 
-    pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_link(g_state.meta_nfs, oldpath, newpath);
-    pthread_mutex_unlock(&g_state.meta_lock);
+    META_RETRY(rc, "link", newpath,
+        nfs_link(g_state.meta_nfs, oldpath, newpath));
 
     if (rc < 0)
         return nfs_err_log(rc, "link", newpath, g_state.meta_nfs);
@@ -1249,9 +1299,8 @@ static int nfuse_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
         if (path == NULL)
             return -EINVAL;
 
-        pthread_mutex_lock(&g_state.meta_lock);
-        rc = nfs_chmod(g_state.meta_nfs, path, mode);
-        pthread_mutex_unlock(&g_state.meta_lock);
+        META_RETRY(rc, "chmod", path,
+            nfs_chmod(g_state.meta_nfs, path, mode));
     }
 
     if (rc < 0)
@@ -1275,9 +1324,8 @@ static int nfuse_chown(const char *path, uid_t uid, gid_t gid,
         if (path == NULL)
             return -EINVAL;
 
-        pthread_mutex_lock(&g_state.meta_lock);
-        rc = nfs_chown(g_state.meta_nfs, path, uid, gid);
-        pthread_mutex_unlock(&g_state.meta_lock);
+        META_RETRY(rc, "chown", path,
+            nfs_chown(g_state.meta_nfs, path, uid, gid));
     }
 
     if (rc < 0)
@@ -1290,9 +1338,8 @@ static int nfuse_mknod(const char *path, mode_t mode, dev_t rdev)
 {
     int rc;
 
-    pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_mknod(g_state.meta_nfs, path, mode, (int)rdev);
-    pthread_mutex_unlock(&g_state.meta_lock);
+    META_RETRY(rc, "mknod", path,
+        nfs_mknod(g_state.meta_nfs, path, mode, (int)rdev));
 
     if (rc < 0)
         return nfs_err_log(rc, "mknod", path, g_state.meta_nfs);
@@ -1304,9 +1351,8 @@ static int nfuse_access(const char *path, int mask)
 {
     int rc;
 
-    pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_access(g_state.meta_nfs, path, mask);
-    pthread_mutex_unlock(&g_state.meta_lock);
+    META_RETRY(rc, "access", path,
+        nfs_access(g_state.meta_nfs, path, mask));
 
     if (rc < 0)
         return nfs_err_log(rc, "access", path, g_state.meta_nfs);
@@ -1352,9 +1398,8 @@ static int nfuse_statfs(const char *path, struct statvfs *st)
 
     memset(st, 0, sizeof(*st));
 
-    pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_statvfs(g_state.meta_nfs, "/", st);
-    pthread_mutex_unlock(&g_state.meta_lock);
+    META_RETRY(rc, "statfs", "/",
+        nfs_statvfs(g_state.meta_nfs, "/", st));
 
     if (rc < 0)
         return nfs_err_log(rc, "statfs", "/", g_state.meta_nfs);
