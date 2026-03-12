@@ -1065,23 +1065,57 @@ static int nfuse_utimens(const char *path, const struct timespec tv[2],
                          struct fuse_file_info *fi)
 {
     struct timeval times[2];
+    struct timeval now;
     int rc;
+    int need_stat;
 
     (void)fi;
 
     if (path == NULL)
         return -EINVAL;
 
+    gettimeofday(&now, NULL);
+
     if (tv == NULL) {
-        times[0].tv_sec = 0;
-        times[0].tv_usec = 0;
-        times[1].tv_sec = 0;
-        times[1].tv_usec = 0;
+        times[0] = now;
+        times[1] = now;
     } else {
-        times[0].tv_sec = tv[0].tv_sec;
-        times[0].tv_usec = (suseconds_t)(tv[0].tv_nsec / 1000);
-        times[1].tv_sec = tv[1].tv_sec;
-        times[1].tv_usec = (suseconds_t)(tv[1].tv_nsec / 1000);
+        need_stat = (tv[0].tv_nsec == UTIME_OMIT) ||
+                    (tv[1].tv_nsec == UTIME_OMIT);
+
+        if (need_stat) {
+            struct nfs_stat_64 st;
+
+            pthread_mutex_lock(&g_state.meta_lock);
+            rc = nfs_lstat64(g_state.meta_nfs, path, &st);
+            pthread_mutex_unlock(&g_state.meta_lock);
+
+            if (rc < 0)
+                return nfs_err_log(rc, "utimens", path, g_state.meta_nfs);
+
+            if (tv[0].tv_nsec == UTIME_OMIT) {
+                times[0].tv_sec = (time_t)st.nfs_atime;
+                times[0].tv_usec = (suseconds_t)(st.nfs_atime_nsec / 1000);
+            }
+            if (tv[1].tv_nsec == UTIME_OMIT) {
+                times[1].tv_sec = (time_t)st.nfs_mtime;
+                times[1].tv_usec = (suseconds_t)(st.nfs_mtime_nsec / 1000);
+            }
+        }
+
+        if (tv[0].tv_nsec == UTIME_NOW) {
+            times[0] = now;
+        } else if (tv[0].tv_nsec != UTIME_OMIT) {
+            times[0].tv_sec = tv[0].tv_sec;
+            times[0].tv_usec = (suseconds_t)(tv[0].tv_nsec / 1000);
+        }
+
+        if (tv[1].tv_nsec == UTIME_NOW) {
+            times[1] = now;
+        } else if (tv[1].tv_nsec != UTIME_OMIT) {
+            times[1].tv_sec = tv[1].tv_sec;
+            times[1].tv_usec = (suseconds_t)(tv[1].tv_nsec / 1000);
+        }
     }
 
     pthread_mutex_lock(&g_state.meta_lock);
