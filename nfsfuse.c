@@ -84,12 +84,19 @@ static void log_nfs_error(const char *op, const char *path,
     const char *nfs_msg;
     int priority;
 
-    if (!g_log_errors)
-        return;
-
     nfs_msg = ctx ? nfs_get_error(ctx) : NULL;
     if (nfs_msg == NULL || nfs_msg[0] == '\0')
         nfs_msg = "unknown error";
+
+    /* ENOENT is normal (file existence checks) — debug only */
+    if (rc == -ENOENT) {
+        DBG("nfsfuse: %s %s: %s (rc=%d/%s)\n",
+            op, path ? path : "", nfs_msg, rc, strerror(-rc));
+        return;
+    }
+
+    if (!g_log_errors)
+        return;
 
     priority = (rc == -ETIMEDOUT) ? LOG_WARNING : LOG_ERR;
 
