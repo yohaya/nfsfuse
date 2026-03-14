@@ -74,6 +74,7 @@ static int g_syslog_open = 0;
 static int g_noatime = 0;
 static int g_nodiratime = 0;
 static int g_noexec = 0;
+static int g_reconnect_on_stale = 0;
 
 #define DBG(...) do { if (g_debug) fprintf(stderr, __VA_ARGS__); } while (0)
 
@@ -174,28 +175,42 @@ static int nfs_err_log(int rc, const char *op, const char *path,
 
 static struct nfs_context *mount_new_context(const char *url);
 
-static int is_nfs4_expired(int rc)
+static int should_reconnect(int rc)
 {
-    return g_state.safe_v4_mode && rc == -ERANGE;
+    if (g_state.safe_v4_mode && rc == -ERANGE)
+        return 1;
+    if (g_reconnect_on_stale && rc == -ESTALE)
+        return 1;
+    return 0;
 }
 
-static int reconnect_meta_context(const char *op, const char *path)
+static const char *reconnect_reason(int rc)
+{
+    if (rc == -ERANGE)
+        return "NFS4ERR_EXPIRED";
+    if (rc == -ESTALE)
+        return "ESTALE";
+    return "NFS error";
+}
+
+static int reconnect_meta_context(int rc, const char *op, const char *path)
 {
     struct nfs_context *new_ctx;
+    const char *reason = reconnect_reason(rc);
 
-    DBG("nfsfuse: NFS4ERR_EXPIRED on %s %s — reconnecting\n",
-        op, path ? path : "");
+    DBG("nfsfuse: %s on %s %s — reconnecting\n",
+        reason, op, path ? path : "");
 
     if (g_log_errors)
-        syslog(LOG_WARNING, "NFS4ERR_EXPIRED on %s %s — reconnecting",
-               op, path ? path : "");
+        syslog(LOG_WARNING, "%s on %s %s — reconnecting",
+               reason, op, path ? path : "");
 
     new_ctx = mount_new_context(g_state.url_effective);
     if (new_ctx == NULL) {
         DBG("nfsfuse: reconnect failed\n");
         if (g_log_errors)
-            syslog(LOG_ERR, "reconnect failed after NFS4ERR_EXPIRED on %s %s",
-                   op, path ? path : "");
+            syslog(LOG_ERR, "reconnect failed after %s on %s %s",
+                   reason, op, path ? path : "");
         return -1;
     }
 
@@ -207,14 +222,15 @@ static int reconnect_meta_context(const char *op, const char *path)
 
     DBG("nfsfuse: reconnected successfully\n");
     if (g_log_errors)
-        syslog(LOG_NOTICE, "reconnected after NFS4ERR_EXPIRED, retrying %s %s",
-               op, path ? path : "");
+        syslog(LOG_NOTICE, "reconnected after %s, retrying %s %s",
+               reason, op, path ? path : "");
 
     return 0;
 }
 
 /*
- * Lock meta, execute NFS call, unlock. On NFS4ERR_EXPIRED, reconnect
+ * Lock meta, execute NFS call, unlock. On reconnectable errors
+ * (NFS4ERR_EXPIRED or ESTALE with --reconnect-on-stale), reconnect
  * and retry once. The 'call' expression is evaluated twice on retry
  * and must use g_state.meta_nfs (which is updated by reconnect).
  */
@@ -222,8 +238,8 @@ static int reconnect_meta_context(const char *op, const char *path)
     pthread_mutex_lock(&g_state.meta_lock);                     \
     (rc) = (call);                                              \
     pthread_mutex_unlock(&g_state.meta_lock);                   \
-    if ((rc) < 0 && is_nfs4_expired(rc) &&                      \
-        reconnect_meta_context((op), (path)) == 0) {            \
+    if ((rc) < 0 && should_reconnect(rc) &&                     \
+        reconnect_meta_context((rc), (op), (path)) == 0) {      \
         pthread_mutex_lock(&g_state.meta_lock);                 \
         (rc) = (call);                                          \
         pthread_mutex_unlock(&g_state.meta_lock);               \
@@ -1001,8 +1017,8 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
     int rc;
 
     rc = open_file_handle_common(path, flags, 0, 0, &h);
-    if (rc < 0 && is_nfs4_expired(rc) &&
-        reconnect_meta_context("open", path) == 0)
+    if (rc < 0 && should_reconnect(rc) &&
+        reconnect_meta_context(rc, "open", path) == 0)
         rc = open_file_handle_common(path, flags, 0, 0, &h);
     if (rc < 0)
         return rc;
@@ -1029,8 +1045,8 @@ static int nfuse_create(const char *path, mode_t mode, struct fuse_file_info *fi
     int rc;
 
     rc = open_file_handle_common(path, flags, mode, 1, &h);
-    if (rc < 0 && is_nfs4_expired(rc) &&
-        reconnect_meta_context("create", path) == 0)
+    if (rc < 0 && should_reconnect(rc) &&
+        reconnect_meta_context(rc, "create", path) == 0)
         rc = open_file_handle_common(path, flags, mode, 1, &h);
     if (rc < 0)
         return rc;
@@ -1534,6 +1550,7 @@ static void usage(const char *prog)
         "  --noatime            Do not update access time on read\n"
         "  --nodiratime         Do not update directory access time\n"
         "  --noexec             Disallow execution of binaries on mount\n"
+        "  --reconnect-on-stale Auto-reconnect on stale file handle (ESTALE)\n"
         "  --version            Show version information\n\n"
         "Timeout and retry options:\n"
         "  --timeout <ms>       RPC request timeout in milliseconds (default: 10000)\n"
@@ -1618,6 +1635,7 @@ static int is_nfsfuse_opt(const char *arg)
            strcmp(arg, "--noatime") == 0 ||
            strcmp(arg, "--nodiratime") == 0 ||
            strcmp(arg, "--noexec") == 0 ||
+           strcmp(arg, "--reconnect-on-stale") == 0 ||
            strcmp(arg, "--timeout") == 0 ||
            strcmp(arg, "--retrans") == 0 ||
            strcmp(arg, "--autoreconnect") == 0 ||
@@ -1689,6 +1707,8 @@ int main(int argc, char *argv[])
             g_nodiratime = 1;
         if (strcmp(argv[i], "--noexec") == 0)
             g_noexec = 1;
+        if (strcmp(argv[i], "--reconnect-on-stale") == 0)
+            g_reconnect_on_stale = 1;
         if (is_nfsfuse_opt_with_value(argv[i]) && i + 1 < argc)
             i++;
     }
@@ -1727,6 +1747,8 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--nodiratime") == 0)
             continue;
         if (strcmp(argv[i], "--noexec") == 0)
+            continue;
+        if (strcmp(argv[i], "--reconnect-on-stale") == 0)
             continue;
 
         if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
