@@ -1539,7 +1539,8 @@ static struct fuse_operations nfuse_ops = {
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "nfsfuse %s\n", NFSFUSE_VERSION);
+    fprintf(stderr, "nfsfuse %s (build %s, %s)\n",
+            NFSFUSE_VERSION, NFSFUSE_BUILD, NFSFUSE_BUILD_DATE);
     fprintf(stderr,
         "\nUsage:\n"
         "  %s [options] nfs://server/export/path[?version=3|4] <mountpoint> [FUSE options]\n\n"
@@ -1922,7 +1923,8 @@ int main(int argc, char *argv[])
         for (i = 0; i < fuse_argc; i++)
             DBG("  argv[%d]=%s\n", i, fuse_argv[i]);
     } else {
-        fprintf(stderr, "nfsfuse: %s mounted on %s (nfsv%s%s)\n",
+        fprintf(stderr, "nfsfuse %s (build %s, %s): %s mounted on %s (nfsv%s%s)\n",
+                NFSFUSE_VERSION, NFSFUSE_BUILD, NFSFUSE_BUILD_DATE,
                 g_state.fsname ? g_state.fsname : argv[url_idx],
                 argv[mount_idx],
                 g_state.safe_v4_mode ? "4" : "3",

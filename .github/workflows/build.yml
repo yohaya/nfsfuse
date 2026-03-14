@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-    paths-ignore: ['bin/**']
+    paths-ignore: ['bin/**', 'VERSION']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -22,15 +22,24 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Compute build number and version
+      - name: Compute build number and bump version
         id: meta
         run: |
-          VERSION=$(cat VERSION)
+          # Read current version and bump patch
+          CURRENT=$(cat VERSION)
+          MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+          MINOR=$(echo "$CURRENT" | cut -d. -f2)
+          PATCH=$(echo "$CURRENT" | cut -d. -f3)
+          PATCH=$((PATCH + 1))
+          VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "$VERSION" > VERSION
+
           BUILD=$(git rev-list --count HEAD)
+          BUILD_DATE=$(date -u +%Y-%m-%d_%H:%M:%S_UTC)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "build=$BUILD" >> "$GITHUB_OUTPUT"
-          echo "date=$(date -u +%Y-%m-%d_%H:%M:%S_UTC)" >> "$GITHUB_OUTPUT"
-          echo "Building nfsfuse $VERSION build $BUILD"
+          echo "date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
+          echo "Building nfsfuse $VERSION build $BUILD ($BUILD_DATE)"
 
       - name: Build static binary in Alpine container
         run: |
@@ -89,13 +98,13 @@ jobs:
           ls -lh bin/nfsfuse
           bin/nfsfuse --version
 
-      - name: Commit binary to repo
+      - name: Commit binary and version to repo
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f bin/nfsfuse
-          git diff --cached --quiet && echo "No changes" || git commit -m "Update bin/nfsfuse" && git push
+          git add -f bin/nfsfuse VERSION
+          git diff --cached --quiet && echo "No changes" || git commit -m "Build ${{ steps.meta.outputs.version }} (${{ steps.meta.outputs.date }})" && git push
 
   release:
     needs: build
