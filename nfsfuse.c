@@ -76,7 +76,7 @@ static int g_nodiratime = 0;
 static int g_noexec = 0;
 static int g_reconnect_on_stale = 0;
 
-#define DBG(...) do { if (g_debug) fprintf(stderr, __VA_ARGS__); } while (0)
+#define DBG(lvl, ...) do { if (g_debug >= (lvl)) fprintf(stderr, __VA_ARGS__); } while (0)
 
 static void log_nfs_error(const char *op, const char *path,
                           int rc, struct nfs_context *ctx)
@@ -90,7 +90,7 @@ static void log_nfs_error(const char *op, const char *path,
 
     /* ENOENT is normal (file existence checks) — debug only */
     if (rc == -ENOENT) {
-        DBG("nfsfuse: %s %s: %s (rc=%d/%s)\n",
+        DBG(2, "nfsfuse: %s %s: %s (rc=%d/%s)\n",
             op, path ? path : "", nfs_msg, rc, strerror(-rc));
         return;
     }
@@ -205,7 +205,7 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
     struct nfs_context *new_ctx;
     const char *reason = reconnect_reason(rc);
 
-    DBG("nfsfuse: %s on %s %s — reconnecting\n",
+    DBG(1, "nfsfuse: %s on %s %s — reconnecting\n",
         reason, op, path ? path : "");
 
     if (g_log_errors)
@@ -214,7 +214,7 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
 
     new_ctx = mount_new_context(g_state.url_effective);
     if (new_ctx == NULL) {
-        DBG("nfsfuse: reconnect failed\n");
+        DBG(1, "nfsfuse: reconnect failed\n");
         if (g_log_errors)
             syslog(LOG_ERR, "reconnect failed after %s on %s %s",
                    reason, op, path ? path : "");
@@ -227,7 +227,7 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
     g_state.meta_nfs = new_ctx;
     pthread_mutex_unlock(&g_state.meta_lock);
 
-    DBG("nfsfuse: reconnected successfully\n");
+    DBG(1, "nfsfuse: reconnected successfully\n");
     if (g_log_errors)
         syslog(LOG_NOTICE, "reconnected after %s, retrying %s %s",
                reason, op, path ? path : "");
@@ -462,23 +462,23 @@ static void apply_nfs_tuning(struct nfs_context *ctx)
 {
     if (g_state.has_timeout) {
         nfs_set_timeout(ctx, g_state.timeout);
-        DBG("  timeout=%dms\n", g_state.timeout);
+        DBG(1, "  timeout=%dms\n", g_state.timeout);
     }
     if (g_state.has_retrans) {
         nfs_set_retrans(ctx, g_state.retrans);
-        DBG("  retrans=%d\n", g_state.retrans);
+        DBG(1, "  retrans=%d\n", g_state.retrans);
     }
     if (g_state.has_autoreconnect) {
         nfs_set_autoreconnect(ctx, g_state.autoreconnect);
-        DBG("  autoreconnect=%d\n", g_state.autoreconnect);
+        DBG(1, "  autoreconnect=%d\n", g_state.autoreconnect);
     }
     if (g_state.has_tcp_syncnt) {
         nfs_set_tcp_syncnt(ctx, g_state.tcp_syncnt);
-        DBG("  tcp_syncnt=%d\n", g_state.tcp_syncnt);
+        DBG(1, "  tcp_syncnt=%d\n", g_state.tcp_syncnt);
     }
     if (g_state.has_poll_timeout) {
         nfs_set_poll_timeout(ctx, g_state.poll_timeout);
-        DBG("  poll_timeout=%dms\n", g_state.poll_timeout);
+        DBG(1, "  poll_timeout=%dms\n", g_state.poll_timeout);
     }
 }
 
@@ -487,14 +487,14 @@ static struct nfs_context *mount_new_context(const char *url)
     struct nfs_context *ctx = NULL;
     struct nfs_url *nurl = NULL;
 
-    DBG("  nfs_init_context...\n");
+    DBG(1, "  nfs_init_context...\n");
     ctx = nfs_init_context();
     if (ctx == NULL)
         return NULL;
 
     apply_nfs_tuning(ctx);
 
-    DBG("  nfs_parse_url_dir...\n");
+    DBG(1, "  nfs_parse_url_dir...\n");
     nurl = nfs_parse_url_dir(ctx, url);
     if (nurl == NULL) {
         fprintf(stderr, "nfsfuse: url parse failed: %s\n", nfs_get_error(ctx));
@@ -502,11 +502,11 @@ static struct nfs_context *mount_new_context(const char *url)
         return NULL;
     }
 
-    DBG("  server=%s path=%s\n",
+    DBG(1, "  server=%s path=%s\n",
         nurl->server ? nurl->server : "(null)",
         nurl->path ? nurl->path : "(null)");
 
-    DBG("  nfs_mount...\n");
+    DBG(1, "  nfs_mount...\n");
     if (nfs_mount(ctx, nurl->server, nurl->path) != 0) {
         fprintf(stderr, "nfsfuse: mount failed: %s\n", nfs_get_error(ctx));
         nfs_destroy_url(nurl);
@@ -514,7 +514,7 @@ static struct nfs_context *mount_new_context(const char *url)
         return NULL;
     }
 
-    DBG("  mount ok\n");
+    DBG(1, "  mount ok\n");
     nfs_destroy_url(nurl);
     return ctx;
 }
@@ -854,6 +854,8 @@ static int nfuse_getattr(const char *path, struct stat *stbuf, struct fuse_file_
     struct nfs_stat_64 st;
     int rc;
 
+    DBG(2, "nfsfuse: getattr %s\n", path ? path : "(null)");
+
     if (fi && fi->fh) {
         struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
 
@@ -872,6 +874,9 @@ static int nfuse_getattr(const char *path, struct stat *stbuf, struct fuse_file_
         return nfs_err_log(rc, "getattr", path, g_state.meta_nfs);
 
     fill_stat_from_nfs64(stbuf, &st);
+    DBG(3, "nfsfuse: getattr %s -> mode=%o size=%lld uid=%d gid=%d\n",
+        path ? path : "(null)", (int)stbuf->st_mode,
+        (long long)stbuf->st_size, (int)stbuf->st_uid, (int)stbuf->st_gid);
     return 0;
 }
 
@@ -882,6 +887,8 @@ static int nfuse_opendir(const char *path, struct fuse_file_info *fi)
     struct nfsdir *dir = NULL;
     int rc;
     int use_private_ctx = g_state.max_mode && !g_state.safe_v4_mode;
+
+    DBG(2, "nfsfuse: opendir %s\n", path ? path : "(null)");
 
     h = calloc(1, sizeof(*h));
     if (h == NULL)
@@ -952,6 +959,8 @@ static int nfuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     (void)path;
     (void)flags;
 
+    DBG(2, "nfsfuse: readdir %s off=%lld\n", path ? path : "(null)", (long long)off);
+
     if (h == NULL)
         return -EBADF;
 
@@ -999,6 +1008,8 @@ static int nfuse_releasedir(const char *path, struct fuse_file_info *fi)
 
     (void)path;
 
+    DBG(2, "nfsfuse: releasedir %s\n", path ? path : "(null)");
+
     if (h == NULL)
         return 0;
 
@@ -1022,6 +1033,9 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
     struct file_handle *h = NULL;
     int flags = sanitize_open_flags(fi->flags);
     int rc;
+
+    DBG(2, "nfsfuse: open %s\n", path ? path : "(null)");
+    DBG(3, "nfsfuse: open %s flags=0x%x\n", path ? path : "(null)", flags);
 
     rc = open_file_handle_common(path, flags, 0, 0, &h);
     if (rc < 0 && should_reconnect(rc) &&
@@ -1051,6 +1065,10 @@ static int nfuse_create(const char *path, mode_t mode, struct fuse_file_info *fi
     int flags = sanitize_open_flags(fi->flags);
     int rc;
 
+    DBG(2, "nfsfuse: create %s\n", path ? path : "(null)");
+    DBG(3, "nfsfuse: create %s mode=%o flags=0x%x\n",
+        path ? path : "(null)", (int)mode, flags);
+
     rc = open_file_handle_common(path, flags, mode, 1, &h);
     if (rc < 0 && should_reconnect(rc) &&
         reconnect_meta_context(rc, "create", path) == 0)
@@ -1079,6 +1097,8 @@ static int nfuse_release(const char *path, struct fuse_file_info *fi)
 
     (void)path;
 
+    DBG(2, "nfsfuse: release %s\n", path ? path : "(null)");
+
     if (h == NULL)
         return 0;
 
@@ -1099,31 +1119,47 @@ static int nfuse_read(const char *path, char *buf, size_t size, off_t offset,
                       struct fuse_file_info *fi)
 {
     struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
+    int rc;
 
     (void)path;
+
+    DBG(3, "nfsfuse: read %s size=%zu off=%lld\n",
+        path ? path : "(null)", size, (long long)offset);
 
     if (h == NULL)
         return -EBADF;
 
-    return pread_full(h, buf, size, offset);
+    rc = pread_full(h, buf, size, offset);
+    DBG(3, "nfsfuse: read %s -> %d\n", path ? path : "(null)", rc);
+    return rc;
 }
 
 static int nfuse_write(const char *path, const char *buf, size_t size, off_t offset,
                        struct fuse_file_info *fi)
 {
     struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
+    int rc;
 
     (void)path;
+
+    DBG(3, "nfsfuse: write %s size=%zu off=%lld\n",
+        path ? path : "(null)", size, (long long)offset);
 
     if (h == NULL)
         return -EBADF;
 
-    return pwrite_full(h, buf, size, offset);
+    rc = pwrite_full(h, buf, size, offset);
+    DBG(3, "nfsfuse: write %s -> %d\n", path ? path : "(null)", rc);
+    return rc;
 }
 
 static int nfuse_truncate(const char *path, off_t size, struct fuse_file_info *fi)
 {
     int rc;
+
+    DBG(2, "nfsfuse: truncate %s\n", path ? path : "(null)");
+    DBG(3, "nfsfuse: truncate %s size=%lld\n",
+        path ? path : "(null)", (long long)size);
 
     if (fi && fi->fh) {
         struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
@@ -1154,6 +1190,8 @@ static int nfuse_utimens(const char *path, const struct timespec tv[2],
     int need_stat;
 
     (void)fi;
+
+    DBG(2, "nfsfuse: utimens %s\n", path ? path : "(null)");
 
     if (path == NULL)
         return -EINVAL;
@@ -1214,6 +1252,8 @@ static int nfuse_unlink(const char *path)
 {
     int rc;
 
+    DBG(2, "nfsfuse: unlink %s\n", path ? path : "(null)");
+
     META_RETRY(rc, "unlink", path,
         nfs_unlink(g_state.meta_nfs, path));
 
@@ -1229,6 +1269,9 @@ static int nfuse_mkdir(const char *path, mode_t mode)
 
     (void)mode;
 
+    DBG(2, "nfsfuse: mkdir %s\n", path ? path : "(null)");
+    DBG(3, "nfsfuse: mkdir %s mode=%o\n", path ? path : "(null)", (int)mode);
+
     META_RETRY(rc, "mkdir", path,
         CALL_NFS_MKDIR(g_state.meta_nfs, path, mode));
 
@@ -1242,6 +1285,8 @@ static int nfuse_rmdir(const char *path)
 {
     int rc;
 
+    DBG(2, "nfsfuse: rmdir %s\n", path ? path : "(null)");
+
     META_RETRY(rc, "rmdir", path,
         nfs_rmdir(g_state.meta_nfs, path));
 
@@ -1254,6 +1299,9 @@ static int nfuse_rmdir(const char *path)
 static int nfuse_rename(const char *from, const char *to, unsigned int flags)
 {
     int rc;
+
+    DBG(2, "nfsfuse: rename %s -> %s\n",
+        from ? from : "(null)", to ? to : "(null)");
 
     if (flags != 0)
         return -EINVAL;
@@ -1270,6 +1318,8 @@ static int nfuse_rename(const char *from, const char *to, unsigned int flags)
 static int nfuse_readlink(const char *path, char *buf, size_t size)
 {
     int rc;
+
+    DBG(2, "nfsfuse: readlink %s\n", path ? path : "(null)");
 
     if (path == NULL || buf == NULL || size == 0)
         return -EINVAL;
@@ -1288,6 +1338,9 @@ static int nfuse_symlink(const char *target, const char *linkpath)
 {
     int rc;
 
+    DBG(2, "nfsfuse: symlink %s -> %s\n",
+        linkpath ? linkpath : "(null)", target ? target : "(null)");
+
     META_RETRY(rc, "symlink", linkpath,
         nfs_symlink(g_state.meta_nfs, target, linkpath));
 
@@ -1301,6 +1354,9 @@ static int nfuse_link(const char *oldpath, const char *newpath)
 {
     int rc;
 
+    DBG(2, "nfsfuse: link %s -> %s\n",
+        newpath ? newpath : "(null)", oldpath ? oldpath : "(null)");
+
     META_RETRY(rc, "link", newpath,
         nfs_link(g_state.meta_nfs, oldpath, newpath));
 
@@ -1313,6 +1369,9 @@ static int nfuse_link(const char *oldpath, const char *newpath)
 static int nfuse_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
     int rc;
+
+    DBG(2, "nfsfuse: chmod %s\n", path ? path : "(null)");
+    DBG(3, "nfsfuse: chmod %s mode=%o\n", path ? path : "(null)", (int)mode);
 
     if (fi && fi->fh) {
         struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
@@ -1339,6 +1398,10 @@ static int nfuse_chown(const char *path, uid_t uid, gid_t gid,
 {
     int rc;
 
+    DBG(2, "nfsfuse: chown %s\n", path ? path : "(null)");
+    DBG(3, "nfsfuse: chown %s uid=%d gid=%d\n",
+        path ? path : "(null)", (int)uid, (int)gid);
+
     if (fi && fi->fh) {
         struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
 
@@ -1363,6 +1426,10 @@ static int nfuse_mknod(const char *path, mode_t mode, dev_t rdev)
 {
     int rc;
 
+    DBG(2, "nfsfuse: mknod %s\n", path ? path : "(null)");
+    DBG(3, "nfsfuse: mknod %s mode=%o rdev=%ld\n",
+        path ? path : "(null)", (int)mode, (long)rdev);
+
     META_RETRY(rc, "mknod", path,
         nfs_mknod(g_state.meta_nfs, path, mode, (int)rdev));
 
@@ -1375,6 +1442,9 @@ static int nfuse_mknod(const char *path, mode_t mode, dev_t rdev)
 static int nfuse_access(const char *path, int mask)
 {
     int rc;
+
+    DBG(2, "nfsfuse: access %s\n", path ? path : "(null)");
+    DBG(3, "nfsfuse: access %s mask=0x%x\n", path ? path : "(null)", mask);
 
     META_RETRY(rc, "access", path,
         nfs_access(g_state.meta_nfs, path, mask));
@@ -1400,6 +1470,8 @@ static int nfuse_fsync(const char *path, int datasync, struct fuse_file_info *fi
     (void)path;
     (void)datasync;
 
+    DBG(2, "nfsfuse: fsync %s\n", path ? path : "(null)");
+
     if (fi == NULL || fi->fh == 0)
         return 0;
 
@@ -1420,6 +1492,8 @@ static int nfuse_statfs(const char *path, struct statvfs *st)
     int rc;
 
     (void)path;
+
+    DBG(2, "nfsfuse: statfs\n");
 
     memset(st, 0, sizeof(*st));
 
@@ -1553,7 +1627,10 @@ static void usage(const char *prog)
         "  %s [options] nfs://server/export/path[?version=3|4] <mountpoint> [FUSE options]\n\n"
         "Options:\n"
         "  --max                Enable performance optimizations\n"
-        "  --debug              Print debug tracing to stderr\n"
+        "  --debug [level]      Print debug tracing to stderr (default level 1)\n"
+        "                         1 = mount/config/reconnect info\n"
+        "                         2 = all FUSE operations (path + result)\n"
+        "                         3 = detailed parameters (offsets, sizes, flags, modes)\n"
         "  --log-errors         Log NFS errors to syslog (daemon facility)\n"
         "  --noatime            Do not update access time on read\n"
         "  --nodiratime         Do not update directory access time\n"
@@ -1660,6 +1737,11 @@ static int is_nfsfuse_opt_with_value(const char *arg)
            strcmp(arg, "--poll-timeout") == 0;
 }
 
+static int is_debug_level(const char *s)
+{
+    return s != NULL && s[0] >= '1' && s[0] <= '9' && s[1] == '\0';
+}
+
 static int user_passed_single_thread(int argc, char *argv[])
 {
     int i;
@@ -1705,8 +1787,11 @@ int main(int argc, char *argv[])
             print_version();
             return 0;
         }
-        if (strcmp(argv[i], "--debug") == 0)
+        if (strcmp(argv[i], "--debug") == 0) {
             g_debug = 1;
+            if (i + 1 < argc && is_debug_level(argv[i + 1]))
+                g_debug = atoi(argv[++i]);
+        }
         if (strcmp(argv[i], "--log-errors") == 0)
             g_log_errors = 1;
         if (strcmp(argv[i], "--noatime") == 0)
@@ -1746,8 +1831,11 @@ int main(int argc, char *argv[])
             g_state.max_mode = 1;
             continue;
         }
-        if (strcmp(argv[i], "--debug") == 0)
+        if (strcmp(argv[i], "--debug") == 0) {
+            if (i + 1 < argc && is_debug_level(argv[i + 1]))
+                i++;
             continue;
+        }
         if (strcmp(argv[i], "--log-errors") == 0)
             continue;
         if (strcmp(argv[i], "--noatime") == 0)
@@ -1816,14 +1904,14 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    DBG("nfsfuse: url=%s v4=%d max=%d\n",
+    DBG(1, "nfsfuse: url=%s v4=%d max=%d\n",
         g_state.url_effective, g_state.safe_v4_mode, g_state.max_mode);
 
     g_state.fsname = build_fsname_from_url(g_state.url_base);
     if (g_state.fsname == NULL)
         g_state.fsname = xstrdup("nfsfuse");
 
-    DBG("nfsfuse: mounting...\n");
+    DBG(1, "nfsfuse: mounting...\n");
 
     g_state.meta_nfs = mount_new_context(g_state.url_effective);
     if (g_state.meta_nfs == NULL) {
@@ -1835,7 +1923,7 @@ int main(int argc, char *argv[])
     readmax = nfs_get_readmax(g_state.meta_nfs);
     writemax = nfs_get_writemax(g_state.meta_nfs);
 
-    DBG("nfsfuse: mounted, readmax=%zu writemax=%zu\n", readmax, writemax);
+    DBG(1, "nfsfuse: mounted, readmax=%zu writemax=%zu\n", readmax, writemax);
 
     if (g_state.max_mode) {
         g_state.io_chunk = NFUSE_MAX_IO_CHUNK;
@@ -1909,6 +1997,9 @@ int main(int argc, char *argv[])
         if (is_nfsfuse_opt(argv[i])) {
             if (is_nfsfuse_opt_with_value(argv[i]))
                 i++;
+            else if (strcmp(argv[i], "--debug") == 0 &&
+                     i + 1 < argc && is_debug_level(argv[i + 1]))
+                i++;
             continue;
         }
 
@@ -1933,9 +2024,9 @@ int main(int argc, char *argv[])
             g_state.max_mode ? ", max" : "");
 
     if (g_debug) {
-        DBG("nfsfuse: starting fuse (argc=%d)\n", fuse_argc);
+        DBG(1, "nfsfuse: starting fuse (argc=%d)\n", fuse_argc);
         for (i = 0; i < fuse_argc; i++)
-            DBG("  argv[%d]=%s\n", i, fuse_argv[i]);
+            DBG(1, "  argv[%d]=%s\n", i, fuse_argv[i]);
     }
 
     rc = fuse_main(fuse_argc, fuse_argv, &nfuse_ops, NULL);
