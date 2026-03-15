@@ -151,6 +151,7 @@ struct file_handle {
     struct nfsfh *fh;
     pthread_mutex_t lock;
     int own_ctx;
+    int writable;
 };
 
 struct dir_entry {
@@ -684,6 +685,7 @@ static int open_file_handle_common(const char *path, int flags, mode_t mode,
     h->ctx = ctx;
     h->fh = fh;
     h->own_ctx = use_private_ctx;
+    h->writable = create || (flags & (O_WRONLY | O_RDWR));
 
     if (pthread_mutex_init(&h->lock, NULL) != 0) {
         if (use_private_ctx)
@@ -1112,6 +1114,8 @@ static int nfuse_release(const char *path, struct fuse_file_info *fi)
         return 0;
 
     file_handle_lock(h);
+    if (h->writable)
+        nfs_fsync(h->ctx, h->fh);
     nfs_close(h->ctx, h->fh);
     file_handle_unlock(h);
 
@@ -1262,6 +1266,7 @@ static int nfuse_unlink(const char *path)
     int rc;
 
     DBG(2, "nfsfuse: unlink %s\n", path ? path : "(null)");
+    DBG(3, "nfsfuse: unlink %s\n", path ? path : "(null)");
 
     META_RETRY(rc, "unlink", path,
         nfs_unlink(g_state.meta_nfs, path));
@@ -1295,6 +1300,7 @@ static int nfuse_rmdir(const char *path)
     int rc;
 
     DBG(2, "nfsfuse: rmdir %s\n", path ? path : "(null)");
+    DBG(3, "nfsfuse: rmdir %s\n", path ? path : "(null)");
 
     META_RETRY(rc, "rmdir", path,
         nfs_rmdir(g_state.meta_nfs, path));
@@ -1466,8 +1472,26 @@ static int nfuse_access(const char *path, int mask)
 
 static int nfuse_flush(const char *path, struct fuse_file_info *fi)
 {
-    (void)path;
-    (void)fi;
+    struct file_handle *h;
+    int rc;
+
+    if (fi == NULL || fi->fh == 0)
+        return 0;
+
+    h = (struct file_handle *)(uintptr_t)fi->fh;
+
+    if (!h->writable)
+        return 0;
+
+    DBG(2, "nfsfuse: flush (fsync) %s\n", path ? path : "(null)");
+
+    file_handle_lock(h);
+    rc = nfs_fsync(h->ctx, h->fh);
+    file_handle_unlock(h);
+
+    if (rc < 0)
+        return nfs_err_log(rc, "flush/fsync", path, h->ctx);
+
     return 0;
 }
 
