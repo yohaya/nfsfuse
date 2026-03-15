@@ -144,6 +144,10 @@ struct app_state {
     int has_autoreconnect;
     int has_tcp_syncnt;
     int has_poll_timeout;
+
+    /* NFS4 lease keepalive thread */
+    pthread_t keepalive_thread;
+    int keepalive_running;
 };
 
 struct file_handle {
@@ -479,8 +483,20 @@ static void apply_nfs_tuning(struct nfs_context *ctx)
         DBG(1, "  retrans=%d\n", g_state.retrans);
     }
     if (g_state.has_autoreconnect) {
-        nfs_set_autoreconnect(ctx, g_state.autoreconnect);
-        DBG(1, "  autoreconnect=%d\n", g_state.autoreconnect);
+        /*
+         * For NFS4, TCP-level autoreconnect is dangerous: it silently
+         * creates a new NFS4 session (new clientid), invalidating all
+         * stateids from the old session.  Open file handles still
+         * reference the old context and will get errors.  Limit
+         * autoreconnect to at most 3 attempts for NFS4 to allow
+         * transient recovery without endless silent state loss.
+         */
+        int ar = g_state.autoreconnect;
+        if (g_state.safe_v4_mode && ar > 3)
+            ar = 3;
+        nfs_set_autoreconnect(ctx, ar);
+        DBG(1, "  autoreconnect=%d%s\n", ar,
+            (ar != g_state.autoreconnect) ? " (capped for NFS4)" : "");
     }
     if (g_state.has_tcp_syncnt) {
         nfs_set_tcp_syncnt(ctx, g_state.tcp_syncnt);
@@ -529,8 +545,60 @@ static struct nfs_context *mount_new_context(const char *url)
     return ctx;
 }
 
+/*
+ * NFS4 lease keepalive thread.  NFS4 requires the client to renew its
+ * lease periodically (typically every 90 seconds).  In single-threaded
+ * FUSE mode, long-running I/O (e.g. 32 GB VMDK reads) can block the
+ * FUSE thread for minutes, preventing any NFS4 lease renewal from
+ * happening through normal traffic.  This background thread sends a
+ * lightweight getattr("/") every 30 seconds to keep the lease alive.
+ */
+static void *keepalive_thread_func(void *arg)
+{
+    struct nfs_stat_64 st;
+
+    (void)arg;
+
+    while (g_state.keepalive_running) {
+        sleep(30);
+
+        if (!g_state.keepalive_running)
+            break;
+
+        pthread_mutex_lock(&g_state.meta_lock);
+        if (g_state.meta_nfs)
+            nfs_lstat64(g_state.meta_nfs, "/", &st);
+        pthread_mutex_unlock(&g_state.meta_lock);
+
+        DBG(3, "nfsfuse: keepalive tick\n");
+    }
+
+    return NULL;
+}
+
+static int start_keepalive_thread(void)
+{
+    g_state.keepalive_running = 1;
+    if (pthread_create(&g_state.keepalive_thread, NULL,
+                       keepalive_thread_func, NULL) != 0) {
+        g_state.keepalive_running = 0;
+        return -1;
+    }
+    return 0;
+}
+
+static void stop_keepalive_thread(void)
+{
+    if (g_state.keepalive_running) {
+        g_state.keepalive_running = 0;
+        pthread_join(g_state.keepalive_thread, NULL);
+    }
+}
+
 static void cleanup_app_state(void)
 {
+    stop_keepalive_thread();
+
     if (g_state.meta_nfs) {
         nfs_destroy_context(g_state.meta_nfs);
         g_state.meta_nfs = NULL;
@@ -549,6 +617,17 @@ static void cleanup_app_state(void)
         pthread_mutex_destroy(&g_state.meta_lock);
         g_state.meta_lock_init = 0;
     }
+}
+
+/*
+ * For shared-context handles (own_ctx=0), always use the current
+ * g_state.meta_nfs rather than the stale h->ctx pointer.  After a
+ * reconnect, g_state.meta_nfs points to the new context while h->ctx
+ * still points to the old (dead) one.
+ */
+static struct nfs_context *file_handle_ctx(struct file_handle *h)
+{
+    return h->own_ctx ? h->ctx : g_state.meta_nfs;
 }
 
 static void file_handle_lock(struct file_handle *h)
@@ -634,28 +713,16 @@ static int open_file_handle_common(const char *path, int flags, mode_t mode,
     }
 
     if (use_private_ctx) {
-        if (create) {
+        if (create)
             rc = nfs_creat(ctx, path, mode, &fh);
-            if (rc >= 0) {
-                nfs_close(ctx, fh);
-                fh = NULL;
-                rc = nfs_open(ctx, path, flags, &fh);
-            }
-        } else {
+        else
             rc = nfs_open(ctx, path, flags, &fh);
-        }
     } else {
         pthread_mutex_lock(&g_state.meta_lock);
-        if (create) {
+        if (create)
             rc = nfs_creat(ctx, path, mode, &fh);
-            if (rc >= 0) {
-                nfs_close(ctx, fh);
-                fh = NULL;
-                rc = nfs_open(ctx, path, flags, &fh);
-            }
-        } else {
+        else
             rc = nfs_open(ctx, path, flags, &fh);
-        }
         pthread_mutex_unlock(&g_state.meta_lock);
     }
 
@@ -664,6 +731,21 @@ static int open_file_handle_common(const char *path, int flags, mode_t mode,
         if (use_private_ctx)
             destroy_nfs_context_safe(ctx);
         return nfs_err(rc);
+    }
+
+    /*
+     * libnfs nfs_creat() on NFS4 may not properly set the file mode
+     * in the OPEN+CREATE compound attrs, resulting in mode=0000 on the
+     * server.  Explicitly chmod after create to ensure correct perms.
+     */
+    if (create && mode != 0) {
+        if (use_private_ctx)
+            nfs_fchmod(ctx, fh, mode);
+        else {
+            pthread_mutex_lock(&g_state.meta_lock);
+            nfs_fchmod(ctx, fh, mode);
+            pthread_mutex_unlock(&g_state.meta_lock);
+        }
     }
 
     h = calloc(1, sizeof(*h));
@@ -720,10 +802,10 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
         if (g_state.max_mode && !g_state.safe_v4_mode && chunk > g_state.io_chunk)
             chunk = g_state.io_chunk;
 
-        rc = CALL_NFS_PREAD(h->ctx, h->fh, offset + (off_t)done, chunk, buf + done);
+        rc = CALL_NFS_PREAD(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
         if (rc < 0) {
             if (done == 0) {
-                log_nfs_error("read", NULL, nfs_err(rc), h->ctx);
+                log_nfs_error("read", NULL, nfs_err(rc), file_handle_ctx(h));
                 file_handle_unlock(h);
                 return nfs_err(rc);
             }
@@ -756,10 +838,10 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
         if (g_state.max_mode && !g_state.safe_v4_mode && chunk > g_state.io_chunk)
             chunk = g_state.io_chunk;
 
-        rc = CALL_NFS_PWRITE(h->ctx, h->fh, offset + (off_t)done, chunk, buf + done);
+        rc = CALL_NFS_PWRITE(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
         if (rc < 0) {
             if (done == 0) {
-                log_nfs_error("write", NULL, nfs_err(rc), h->ctx);
+                log_nfs_error("write", NULL, nfs_err(rc), file_handle_ctx(h));
                 file_handle_unlock(h);
                 return nfs_err(rc);
             }
@@ -871,7 +953,7 @@ static int nfuse_getattr(const char *path, struct stat *stbuf, struct fuse_file_
         struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
 
         file_handle_lock(h);
-        rc = nfs_fstat64(h->ctx, h->fh, &st);
+        rc = nfs_fstat64(file_handle_ctx(h), h->fh, &st);
         file_handle_unlock(h);
     } else {
         if (path == NULL)
@@ -1115,12 +1197,12 @@ static int nfuse_release(const char *path, struct fuse_file_info *fi)
 
     file_handle_lock(h);
     if (h->writable)
-        nfs_fsync(h->ctx, h->fh);
-    nfs_close(h->ctx, h->fh);
+        nfs_fsync(file_handle_ctx(h), h->fh);
+    nfs_close(file_handle_ctx(h), h->fh);
     file_handle_unlock(h);
 
     if (h->own_ctx)
-        destroy_nfs_context_safe(h->ctx);
+        destroy_nfs_context_safe(h->ctx);  /* own_ctx: h->ctx is correct */
 
     pthread_mutex_destroy(&h->lock);
     free(h);
@@ -1178,7 +1260,7 @@ static int nfuse_truncate(const char *path, off_t size, struct fuse_file_info *f
         struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
 
         file_handle_lock(h);
-        rc = nfs_ftruncate(h->ctx, h->fh, (uint64_t)size);
+        rc = nfs_ftruncate(file_handle_ctx(h), h->fh, (uint64_t)size);
         file_handle_unlock(h);
     } else {
         if (path == NULL)
@@ -1392,7 +1474,7 @@ static int nfuse_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
         struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
 
         file_handle_lock(h);
-        rc = nfs_fchmod(h->ctx, h->fh, mode);
+        rc = nfs_fchmod(file_handle_ctx(h), h->fh, mode);
         file_handle_unlock(h);
     } else {
         if (path == NULL)
@@ -1421,7 +1503,7 @@ static int nfuse_chown(const char *path, uid_t uid, gid_t gid,
         struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
 
         file_handle_lock(h);
-        rc = nfs_fchown(h->ctx, h->fh, uid, gid);
+        rc = nfs_fchown(file_handle_ctx(h), h->fh, uid, gid);
         file_handle_unlock(h);
     } else {
         if (path == NULL)
@@ -1486,11 +1568,11 @@ static int nfuse_flush(const char *path, struct fuse_file_info *fi)
     DBG(2, "nfsfuse: flush (fsync) %s\n", path ? path : "(null)");
 
     file_handle_lock(h);
-    rc = nfs_fsync(h->ctx, h->fh);
+    rc = nfs_fsync(file_handle_ctx(h), h->fh);
     file_handle_unlock(h);
 
     if (rc < 0)
-        return nfs_err_log(rc, "flush/fsync", path, h->ctx);
+        return nfs_err_log(rc, "flush/fsync", path, file_handle_ctx(h));
 
     return 0;
 }
@@ -1511,11 +1593,11 @@ static int nfuse_fsync(const char *path, int datasync, struct fuse_file_info *fi
     h = (struct file_handle *)(uintptr_t)fi->fh;
 
     file_handle_lock(h);
-    rc = nfs_fsync(h->ctx, h->fh);
+    rc = nfs_fsync(file_handle_ctx(h), h->fh);
     file_handle_unlock(h);
 
     if (rc < 0)
-        return nfs_err_log(rc, "fsync", path, h->ctx);
+        return nfs_err_log(rc, "fsync", path, file_handle_ctx(h));
 
     return 0;
 }
@@ -2083,6 +2165,13 @@ int main(int argc, char *argv[])
         DBG(1, "nfsfuse: starting fuse (argc=%d)\n", fuse_argc);
         for (i = 0; i < fuse_argc; i++)
             DBG(1, "  argv[%d]=%s\n", i, fuse_argv[i]);
+    }
+
+    if (g_state.safe_v4_mode) {
+        if (start_keepalive_thread() == 0)
+            DBG(1, "nfsfuse: NFS4 keepalive thread started\n");
+        else
+            fprintf(stderr, "nfsfuse: warning: could not start keepalive thread\n");
     }
 
     rc = fuse_main(fuse_argc, fuse_argv, &nfuse_ops, NULL);
