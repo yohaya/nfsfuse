@@ -75,8 +75,17 @@ static int g_noatime = 0;
 static int g_nodiratime = 0;
 static int g_noexec = 0;
 static int g_reconnect_on_stale = 0;
+static FILE *g_debug_file = NULL;  /* non-NULL = write debug to file */
+static int g_debug_syslog = 0;    /* 1 = write debug to syslog */
 
-#define DBG(lvl, ...) do { if (g_debug >= (lvl)) fprintf(stderr, __VA_ARGS__); } while (0)
+#define DBG(lvl, ...) do { \
+    if (g_debug >= (lvl)) { \
+        if (g_debug_syslog) \
+            syslog(LOG_DEBUG, __VA_ARGS__); \
+        else \
+            fprintf(g_debug_file ? g_debug_file : stderr, __VA_ARGS__); \
+    } \
+} while (0)
 
 static void log_nfs_error(const char *op, const char *path,
                           int rc, struct nfs_context *ctx)
@@ -1631,6 +1640,9 @@ static void usage(const char *prog)
         "                         1 = mount/config/reconnect info\n"
         "                         2 = all FUSE operations (path + result)\n"
         "                         3 = detailed parameters (offsets, sizes, flags, modes)\n"
+        "  --debug-output <dst> Send debug output to <dst> instead of stderr\n"
+        "                         syslog = write to syslog (daemon.debug)\n"
+        "                         <path> = write to file (e.g. /var/log/nfsfuse.log)\n"
         "  --log-errors         Log NFS errors to syslog (daemon facility)\n"
         "  --noatime            Do not update access time on read\n"
         "  --nodiratime         Do not update directory access time\n"
@@ -1716,6 +1728,7 @@ static int is_nfsfuse_opt(const char *arg)
 {
     return strcmp(arg, "--max") == 0 ||
            strcmp(arg, "--debug") == 0 ||
+           strcmp(arg, "--debug-output") == 0 ||
            strcmp(arg, "--log-errors") == 0 ||
            strcmp(arg, "--noatime") == 0 ||
            strcmp(arg, "--nodiratime") == 0 ||
@@ -1734,7 +1747,8 @@ static int is_nfsfuse_opt_with_value(const char *arg)
            strcmp(arg, "--retrans") == 0 ||
            strcmp(arg, "--autoreconnect") == 0 ||
            strcmp(arg, "--tcp-syncnt") == 0 ||
-           strcmp(arg, "--poll-timeout") == 0;
+           strcmp(arg, "--poll-timeout") == 0 ||
+           strcmp(arg, "--debug-output") == 0;
 }
 
 static int is_debug_level(const char *s)
@@ -1792,6 +1806,20 @@ int main(int argc, char *argv[])
             if (i + 1 < argc && is_debug_level(argv[i + 1]))
                 g_debug = atoi(argv[++i]);
         }
+        if (strcmp(argv[i], "--debug-output") == 0 && i + 1 < argc) {
+            i++;
+            if (strcmp(argv[i], "syslog") == 0)
+                g_debug_syslog = 1;
+            else {
+                g_debug_file = fopen(argv[i], "a");
+                if (g_debug_file == NULL) {
+                    fprintf(stderr, "nfsfuse: cannot open debug output file: %s: %s\n",
+                            argv[i], strerror(errno));
+                    return 1;
+                }
+                setlinebuf(g_debug_file);
+            }
+        }
         if (strcmp(argv[i], "--log-errors") == 0)
             g_log_errors = 1;
         if (strcmp(argv[i], "--noatime") == 0)
@@ -1814,7 +1842,7 @@ int main(int argc, char *argv[])
     if (g_debug)
         print_version();
 
-    if (g_log_errors) {
+    if (g_log_errors || g_debug_syslog) {
         openlog("nfsfuse", LOG_PID, LOG_DAEMON);
         g_syslog_open = 1;
     }
@@ -1834,6 +1862,10 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--debug") == 0) {
             if (i + 1 < argc && is_debug_level(argv[i + 1]))
                 i++;
+            continue;
+        }
+        if (strcmp(argv[i], "--debug-output") == 0 && i + 1 < argc) {
+            i++;
             continue;
         }
         if (strcmp(argv[i], "--log-errors") == 0)
@@ -2036,6 +2068,11 @@ int main(int argc, char *argv[])
     if (g_state.meta_nfs != NULL || g_state.url_base != NULL ||
         g_state.url_effective != NULL || g_state.fsname != NULL)
         cleanup_app_state();
+
+    if (g_debug_file) {
+        fclose(g_debug_file);
+        g_debug_file = NULL;
+    }
 
     if (g_syslog_open)
         closelog();

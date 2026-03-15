@@ -31,6 +31,7 @@ nfsfuse [--max] [--debug] nfs://server/export/path[?version=3|4] <mountpoint> [F
 |-----------|----------------------------------------------|
 | `--max` | Enable performance optimizations |
 | `--debug [level]` | Debug tracing to stderr (1=config/reconnect, 2=operations, 3=detailed) |
+| `--debug-output <dst>` | Send debug to file path or `syslog` instead of stderr |
 | `--log-errors` | Log NFS errors to syslog (daemon facility) |
 | `--noatime` | Do not update access time on read |
 | `--nodiratime` | Do not update directory access time |
@@ -98,6 +99,16 @@ nfsfuse --debug 2 'nfs://192.168.1.100/export/data?version=4' /mnt/nfs
 Full detail (offsets, sizes, flags, modes):
 ```bash
 nfsfuse --debug 3 'nfs://192.168.1.100/export/data?version=4' /mnt/nfs
+```
+
+Debug to a file:
+```bash
+nfsfuse --debug 2 --debug-output /var/log/nfsfuse.log 'nfs://10.0.0.1/data' /mnt/nfs
+```
+
+Debug to syslog:
+```bash
+nfsfuse --debug 2 --debug-output syslog 'nfs://10.0.0.1/data' /mnt/nfs
 ```
 
 Run in foreground with FUSE debug output:
