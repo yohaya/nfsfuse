@@ -1925,17 +1925,17 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    fprintf(stderr, "nfsfuse %s (build %s, %s): %s mounted on %s (nfsv%s%s)\n",
+            NFSFUSE_VERSION, NFSFUSE_BUILD, NFSFUSE_BUILD_DATE,
+            g_state.fsname ? g_state.fsname : argv[url_idx],
+            argv[mount_idx],
+            g_state.safe_v4_mode ? "4" : "3",
+            g_state.max_mode ? ", max" : "");
+
     if (g_debug) {
         DBG("nfsfuse: starting fuse (argc=%d)\n", fuse_argc);
         for (i = 0; i < fuse_argc; i++)
             DBG("  argv[%d]=%s\n", i, fuse_argv[i]);
-    } else {
-        fprintf(stderr, "nfsfuse %s (build %s, %s): %s mounted on %s (nfsv%s%s)\n",
-                NFSFUSE_VERSION, NFSFUSE_BUILD, NFSFUSE_BUILD_DATE,
-                g_state.fsname ? g_state.fsname : argv[url_idx],
-                argv[mount_idx],
-                g_state.safe_v4_mode ? "4" : "3",
-                g_state.max_mode ? ", max" : "");
     }
 
     rc = fuse_main(fuse_argc, fuse_argv, &nfuse_ops, NULL);
