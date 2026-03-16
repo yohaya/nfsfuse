@@ -158,6 +158,156 @@ struct file_handle {
     int writable;
 };
 
+/*
+ * Deferred close pool.  Mimics the kernel NFS client's close-to-open
+ * consistency: after an application closes a file, we keep the NFS4
+ * OPEN state alive for up to DEFERRED_CLOSE_SEC seconds.  This prevents
+ * the NFS server from evicting the file from its name cache or
+ * reclaiming resources while the file may still be needed.
+ *
+ * The ISO disappearance bug: cwmsrv creates two ISOs (phase 0 and
+ * phase 1), writes them, and closes both.  Phase 0 runs for ~3 minutes.
+ * When phase 1 starts and tries to mount the phase 1 ISO, the server
+ * returns NOENT — the file vanished after being closed.  By keeping the
+ * NFS4 OPEN state alive, the server is forced to keep the file accessible.
+ */
+#define DEFERRED_CLOSE_MAX  64
+#define DEFERRED_CLOSE_SEC  300  /* 5 minutes */
+
+struct deferred_close_entry {
+    char path[4096];
+    struct nfs_context *ctx;
+    struct nfsfh *fh;
+    time_t created;
+    int active;
+};
+
+static struct deferred_close_entry g_deferred[DEFERRED_CLOSE_MAX];
+static pthread_mutex_t g_deferred_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void deferred_close_add(const char *path, struct nfs_context *ctx,
+                               struct nfsfh *fh)
+{
+    int i, oldest = -1;
+    time_t oldest_time = 0;
+
+    pthread_mutex_lock(&g_deferred_lock);
+
+    /* Find a free slot or the oldest entry to evict */
+    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
+        if (!g_deferred[i].active) {
+            oldest = i;
+            break;
+        }
+        if (oldest < 0 || g_deferred[i].created < oldest_time) {
+            oldest = i;
+            oldest_time = g_deferred[i].created;
+        }
+    }
+
+    /* Evict oldest if needed */
+    if (g_deferred[oldest].active) {
+        DBG(2, "nfsfuse: deferred close evict %s\n", g_deferred[oldest].path);
+        pthread_mutex_lock(&g_state.meta_lock);
+        nfs_close(g_deferred[oldest].ctx, g_deferred[oldest].fh);
+        pthread_mutex_unlock(&g_state.meta_lock);
+    }
+
+    snprintf(g_deferred[oldest].path, sizeof(g_deferred[oldest].path),
+             "%s", path ? path : "");
+    g_deferred[oldest].ctx = ctx;
+    g_deferred[oldest].fh = fh;
+    g_deferred[oldest].created = time(NULL);
+    g_deferred[oldest].active = 1;
+
+    DBG(2, "nfsfuse: deferred close hold %s (slot %d)\n",
+        path ? path : "", oldest);
+
+    pthread_mutex_unlock(&g_deferred_lock);
+}
+
+/* Close a specific deferred entry by path (e.g., when the file is reopened) */
+static void deferred_close_release(const char *path)
+{
+    int i;
+
+    if (path == NULL)
+        return;
+
+    pthread_mutex_lock(&g_deferred_lock);
+    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
+        if (g_deferred[i].active && strcmp(g_deferred[i].path, path) == 0) {
+            DBG(2, "nfsfuse: deferred close release %s\n", path);
+            pthread_mutex_lock(&g_state.meta_lock);
+            nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
+            pthread_mutex_unlock(&g_state.meta_lock);
+            g_deferred[i].active = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_deferred_lock);
+}
+
+/* Expire old deferred entries — called from keepalive thread */
+static void deferred_close_expire(void)
+{
+    int i;
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&g_deferred_lock);
+    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
+        if (g_deferred[i].active &&
+            (now - g_deferred[i].created) >= DEFERRED_CLOSE_SEC) {
+            DBG(2, "nfsfuse: deferred close expire %s\n", g_deferred[i].path);
+            pthread_mutex_lock(&g_state.meta_lock);
+            nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
+            pthread_mutex_unlock(&g_state.meta_lock);
+            g_deferred[i].active = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_deferred_lock);
+}
+
+/* Close all deferred entries — called on shutdown */
+static void deferred_close_all(void)
+{
+    int i;
+
+    pthread_mutex_lock(&g_deferred_lock);
+    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
+        if (g_deferred[i].active) {
+            nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
+            g_deferred[i].active = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_deferred_lock);
+}
+
+/*
+ * Check if a deferred-close entry exists for a path and use fstat on
+ * the held-open handle.  Returns 1 if found (and fills stbuf), 0 if not.
+ */
+static int deferred_close_fstat(const char *path, struct nfs_stat_64 *st)
+{
+    int i, found = 0;
+
+    if (path == NULL)
+        return 0;
+
+    pthread_mutex_lock(&g_deferred_lock);
+    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
+        if (g_deferred[i].active && strcmp(g_deferred[i].path, path) == 0) {
+            pthread_mutex_lock(&g_state.meta_lock);
+            if (nfs_fstat64(g_deferred[i].ctx, g_deferred[i].fh, st) == 0)
+                found = 1;
+            pthread_mutex_unlock(&g_state.meta_lock);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_deferred_lock);
+
+    return found;
+}
+
 struct dir_entry {
     char *name;
     ino_t ino;
@@ -617,6 +767,8 @@ static void *keepalive_thread_func(void *arg)
             nfs_lstat64(g_state.meta_nfs, "/", &st);
         pthread_mutex_unlock(&g_state.meta_lock);
 
+        deferred_close_expire();
+
         DBG(3, "nfsfuse: keepalive tick\n");
     }
 
@@ -645,6 +797,7 @@ static void stop_keepalive_thread(void)
 static void cleanup_app_state(void)
 {
     stop_keepalive_thread();
+    deferred_close_all();
 
     if (g_state.meta_nfs) {
         nfs_destroy_context(g_state.meta_nfs);
@@ -1038,6 +1191,19 @@ static int nfuse_getattr(const char *path, struct stat *stbuf, struct fuse_file_
 
         META_RETRY(rc, "getattr", path,
             nfs_lstat64(g_state.meta_nfs, path, &st));
+
+        /*
+         * If the NFS server returns NOENT but we have a deferred-close
+         * handle for this path, the file still exists — use fstat on
+         * the held-open handle instead.  This covers the case where the
+         * server evicts the file from its name cache after CLOSE but
+         * the file is still accessible via the open stateid.
+         */
+        if (rc == -ENOENT && deferred_close_fstat(path, &st)) {
+            DBG(1, "nfsfuse: getattr %s recovered via deferred handle\n",
+                path);
+            rc = 0;
+        }
     }
 
     if (rc < 0)
@@ -1207,6 +1373,9 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
     DBG(2, "nfsfuse: open %s\n", path ? path : "(null)");
     DBG(3, "nfsfuse: open %s flags=0x%x\n", path ? path : "(null)", flags);
 
+    /* Release any deferred close for this path before opening fresh */
+    deferred_close_release(path);
+
     {
         int retries = 0, did_reconnect = 0;
         for (;;) {
@@ -1311,11 +1480,24 @@ static int nfuse_release(const char *path, struct fuse_file_info *fi)
     file_handle_lock(h);
     if (h->writable)
         nfs_fsync(file_handle_ctx(h), h->fh);
-    nfs_close(file_handle_ctx(h), h->fh);
-    file_handle_unlock(h);
 
-    if (h->own_ctx)
-        destroy_nfs_context_safe(h->ctx);  /* own_ctx: h->ctx is correct */
+    /*
+     * Deferred close for NFS4: keep the file handle open to maintain
+     * the NFS4 OPEN state on the server, preventing it from evicting
+     * the file from its name cache.  This mimics the kernel NFS
+     * client's close-to-open consistency behavior.  Only for writable
+     * files on the shared context (the ISO creation path).
+     */
+    if (h->writable && !h->own_ctx && g_state.safe_v4_mode && path) {
+        file_handle_unlock(h);
+        deferred_close_add(path, file_handle_ctx(h), h->fh);
+        /* Don't close the NFS handle — it's now owned by deferred pool */
+    } else {
+        nfs_close(file_handle_ctx(h), h->fh);
+        file_handle_unlock(h);
+        if (h->own_ctx)
+            destroy_nfs_context_safe(h->ctx);
+    }
 
     pthread_mutex_destroy(&h->lock);
     free(h);
