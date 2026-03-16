@@ -196,21 +196,43 @@ static int nfs_err_log(int rc, const char *op, const char *path,
 
 static struct nfs_context *mount_new_context(const char *url);
 
-static int should_reconnect(int rc)
+/*
+ * Classify NFS errors for retry strategy:
+ *   RETRY_RECONNECT — session expired, need to remount (EXPIRED, STALE)
+ *   RETRY_WAIT      — server temporarily unavailable (GRACE period)
+ *   RETRY_NONE      — permanent error, don't retry
+ *
+ * libnfs maps NFS4ERR_EXPIRED, NFS4ERR_GRACE, and NFS4ERR_STALE_CLIENTID
+ * all to ERANGE (-34).  We cannot distinguish them by errno alone, so we
+ * treat all ERANGE as retriable.  First attempt reconnects (covers
+ * EXPIRED/STALE_CLIENTID), subsequent attempts wait (covers GRACE).
+ */
+#define RETRY_NONE       0
+#define RETRY_RECONNECT  1
+#define RETRY_WAIT       2
+
+#define NFS4_RETRY_MAX       6
+#define NFS4_RETRY_WAIT_SEC  5
+
+static int classify_nfs_error(int rc)
 {
     if (g_state.safe_v4_mode && rc == -ERANGE)
-        return 1;
+        return RETRY_RECONNECT;
+    if (rc == -ETIMEDOUT)
+        return RETRY_WAIT;
     if (g_reconnect_on_stale && rc == -ESTALE)
-        return 1;
-    return 0;
+        return RETRY_RECONNECT;
+    return RETRY_NONE;
 }
 
 static const char *reconnect_reason(int rc)
 {
     if (rc == -ERANGE)
-        return "NFS4ERR_EXPIRED";
+        return "NFS4ERR_EXPIRED/GRACE";
     if (rc == -ESTALE)
         return "ESTALE";
+    if (rc == -ETIMEDOUT)
+        return "timeout";
     return "NFS error";
 }
 
@@ -250,21 +272,46 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
 }
 
 /*
- * Lock meta, execute NFS call, unlock. On reconnectable errors
- * (NFS4ERR_EXPIRED or ESTALE with --reconnect-on-stale), reconnect
- * and retry once. The 'call' expression is evaluated twice on retry
- * and must use g_state.meta_nfs (which is updated by reconnect).
+ * Resilient metadata operation wrapper.  Handles transient NFS4 errors:
+ *
+ *   1. On EXPIRED/STALE_CLIENTID: reconnect (remount) and retry.
+ *   2. On GRACE/timeout: wait NFS4_RETRY_WAIT_SEC seconds and retry
+ *      without reconnecting — the server is recovering and the current
+ *      session will become valid again once the grace period ends.
+ *   3. Retry up to NFS4_RETRY_MAX times with increasing wait, so we
+ *      can survive a ~30-second grace period.
+ *
+ * The 'call' expression must use g_state.meta_nfs (updated on reconnect).
  */
-#define META_RETRY(rc, op, path, call) do {                     \
-    pthread_mutex_lock(&g_state.meta_lock);                     \
-    (rc) = (call);                                              \
-    pthread_mutex_unlock(&g_state.meta_lock);                   \
-    if ((rc) < 0 && should_reconnect(rc) &&                     \
-        reconnect_meta_context((rc), (op), (path)) == 0) {      \
-        pthread_mutex_lock(&g_state.meta_lock);                 \
-        (rc) = (call);                                          \
-        pthread_mutex_unlock(&g_state.meta_lock);               \
-    }                                                           \
+#define META_RETRY(rc, op, path, call) do {                              \
+    int _retries = 0;                                                    \
+    int _did_reconnect = 0;                                              \
+    for (;;) {                                                           \
+        pthread_mutex_lock(&g_state.meta_lock);                          \
+        (rc) = (call);                                                   \
+        pthread_mutex_unlock(&g_state.meta_lock);                        \
+        if ((rc) >= 0)                                                   \
+            break;                                                       \
+        int _cls = classify_nfs_error(rc);                               \
+        if (_cls == RETRY_NONE || _retries >= NFS4_RETRY_MAX)            \
+            break;                                                       \
+        _retries++;                                                      \
+        if (_cls == RETRY_RECONNECT && !_did_reconnect) {                \
+            if (reconnect_meta_context((rc), (op), (path)) == 0)         \
+                _did_reconnect = 1;                                      \
+            else                                                         \
+                break;                                                   \
+        } else {                                                         \
+            DBG(1, "nfsfuse: %s on %s %s — waiting %ds (retry %d/%d)\n", \
+                reconnect_reason(rc), (op), (path) ? (path) : "",        \
+                NFS4_RETRY_WAIT_SEC, _retries, NFS4_RETRY_MAX);          \
+            if (g_log_errors && _retries == 1)                           \
+                syslog(LOG_WARNING, "%s on %s %s — waiting for server",  \
+                       reconnect_reason(rc), (op),                       \
+                       (path) ? (path) : "");                            \
+            sleep(NFS4_RETRY_WAIT_SEC);                                  \
+        }                                                                \
+    }                                                                    \
 } while (0)
 
 static char *xstrdup(const char *s)
@@ -798,11 +845,26 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
 
     while (done < size) {
         size_t chunk = size - done;
+        int io_retries = 0;
 
         if (g_state.max_mode && !g_state.safe_v4_mode && chunk > g_state.io_chunk)
             chunk = g_state.io_chunk;
 
-        rc = CALL_NFS_PREAD(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
+        for (;;) {
+            rc = CALL_NFS_PREAD(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
+            if (rc >= 0)
+                break;
+            if (classify_nfs_error(rc) == RETRY_NONE ||
+                io_retries >= NFS4_RETRY_MAX)
+                break;
+            io_retries++;
+            DBG(1, "nfsfuse: read transient error — waiting %ds (retry %d/%d)\n",
+                NFS4_RETRY_WAIT_SEC, io_retries, NFS4_RETRY_MAX);
+            file_handle_unlock(h);
+            sleep(NFS4_RETRY_WAIT_SEC);
+            file_handle_lock(h);
+        }
+
         if (rc < 0) {
             if (done == 0) {
                 log_nfs_error("read", NULL, nfs_err(rc), file_handle_ctx(h));
@@ -834,11 +896,26 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
 
     while (done < size) {
         size_t chunk = size - done;
+        int io_retries = 0;
 
         if (g_state.max_mode && !g_state.safe_v4_mode && chunk > g_state.io_chunk)
             chunk = g_state.io_chunk;
 
-        rc = CALL_NFS_PWRITE(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
+        for (;;) {
+            rc = CALL_NFS_PWRITE(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
+            if (rc >= 0)
+                break;
+            if (classify_nfs_error(rc) == RETRY_NONE ||
+                io_retries >= NFS4_RETRY_MAX)
+                break;
+            io_retries++;
+            DBG(1, "nfsfuse: write transient error — waiting %ds (retry %d/%d)\n",
+                NFS4_RETRY_WAIT_SEC, io_retries, NFS4_RETRY_MAX);
+            file_handle_unlock(h);
+            sleep(NFS4_RETRY_WAIT_SEC);
+            file_handle_lock(h);
+        }
+
         if (rc < 0) {
             if (done == 0) {
                 log_nfs_error("write", NULL, nfs_err(rc), file_handle_ctx(h));
@@ -1130,10 +1207,28 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
     DBG(2, "nfsfuse: open %s\n", path ? path : "(null)");
     DBG(3, "nfsfuse: open %s flags=0x%x\n", path ? path : "(null)", flags);
 
-    rc = open_file_handle_common(path, flags, 0, 0, &h);
-    if (rc < 0 && should_reconnect(rc) &&
-        reconnect_meta_context(rc, "open", path) == 0)
-        rc = open_file_handle_common(path, flags, 0, 0, &h);
+    {
+        int retries = 0, did_reconnect = 0;
+        for (;;) {
+            rc = open_file_handle_common(path, flags, 0, 0, &h);
+            if (rc >= 0)
+                break;
+            int cls = classify_nfs_error(rc);
+            if (cls == RETRY_NONE || retries >= NFS4_RETRY_MAX)
+                break;
+            retries++;
+            if (cls == RETRY_RECONNECT && !did_reconnect) {
+                if (reconnect_meta_context(rc, "open", path) == 0)
+                    did_reconnect = 1;
+                else
+                    break;
+            } else {
+                DBG(1, "nfsfuse: open %s — waiting %ds (retry %d/%d)\n",
+                    path ? path : "", NFS4_RETRY_WAIT_SEC, retries, NFS4_RETRY_MAX);
+                sleep(NFS4_RETRY_WAIT_SEC);
+            }
+        }
+    }
     if (rc < 0)
         return rc;
 
@@ -1162,10 +1257,28 @@ static int nfuse_create(const char *path, mode_t mode, struct fuse_file_info *fi
     DBG(3, "nfsfuse: create %s mode=%o flags=0x%x\n",
         path ? path : "(null)", (int)mode, flags);
 
-    rc = open_file_handle_common(path, flags, mode, 1, &h);
-    if (rc < 0 && should_reconnect(rc) &&
-        reconnect_meta_context(rc, "create", path) == 0)
-        rc = open_file_handle_common(path, flags, mode, 1, &h);
+    {
+        int retries = 0, did_reconnect = 0;
+        for (;;) {
+            rc = open_file_handle_common(path, flags, mode, 1, &h);
+            if (rc >= 0)
+                break;
+            int cls = classify_nfs_error(rc);
+            if (cls == RETRY_NONE || retries >= NFS4_RETRY_MAX)
+                break;
+            retries++;
+            if (cls == RETRY_RECONNECT && !did_reconnect) {
+                if (reconnect_meta_context(rc, "create", path) == 0)
+                    did_reconnect = 1;
+                else
+                    break;
+            } else {
+                DBG(1, "nfsfuse: create %s — waiting %ds (retry %d/%d)\n",
+                    path ? path : "", NFS4_RETRY_WAIT_SEC, retries, NFS4_RETRY_MAX);
+                sleep(NFS4_RETRY_WAIT_SEC);
+            }
+        }
+    }
     if (rc < 0)
         return rc;
 
