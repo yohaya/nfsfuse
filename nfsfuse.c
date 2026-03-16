@@ -148,6 +148,12 @@ struct app_state {
     /* NFS4 lease keepalive thread */
     pthread_t keepalive_thread;
     int keepalive_running;
+
+    /* Dead-server watchdog: unmount after N seconds of consecutive failures */
+    int dead_timeout;        /* 0 = disabled */
+    int has_dead_timeout;
+    time_t first_failure;    /* monotonic time of first consecutive failure, 0 = healthy */
+    int dead_triggered;      /* 1 = already triggered unmount */
 };
 
 struct file_handle {
@@ -400,6 +406,61 @@ static int deferred_close_peek(const char *path, struct nfs_context **out_ctx,
 #define NFS4_RETRY_MAX       6
 #define NFS4_RETRY_WAIT_SEC  5
 
+/*
+ * Dead-server watchdog: track consecutive failures.
+ * Call dead_timeout_on_failure() when an NFS operation fails.
+ * Call dead_timeout_on_success() when an NFS operation succeeds.
+ * If failures persist for dead_timeout seconds, trigger FUSE unmount.
+ */
+static struct fuse *g_fuse_instance;  /* set in nfuse_init */
+
+static void dead_timeout_on_failure(void)
+{
+    time_t now;
+
+    if (g_state.dead_timeout <= 0 || g_state.dead_triggered)
+        return;
+
+    now = time(NULL);
+
+    if (g_state.first_failure == 0) {
+        g_state.first_failure = now;
+        DBG(1, "nfsfuse: dead-timeout watchdog started (limit %ds)\n",
+            g_state.dead_timeout);
+        if (g_log_errors)
+            syslog(LOG_WARNING,
+                   "connectivity lost — will unmount after %d seconds",
+                   g_state.dead_timeout);
+        return;
+    }
+
+    if (now - g_state.first_failure >= g_state.dead_timeout) {
+        g_state.dead_triggered = 1;
+        DBG(1, "nfsfuse: dead-timeout reached (%ds) — triggering unmount\n",
+            g_state.dead_timeout);
+        if (g_log_errors)
+            syslog(LOG_CRIT,
+                   "server unreachable for %ld seconds — unmounting",
+                   (long)(now - g_state.first_failure));
+        if (g_fuse_instance)
+            fuse_exit(g_fuse_instance);
+    }
+}
+
+static void dead_timeout_on_success(void)
+{
+    if (g_state.dead_timeout <= 0)
+        return;
+
+    if (g_state.first_failure != 0) {
+        DBG(1, "nfsfuse: dead-timeout watchdog reset — server responded\n");
+        if (g_log_errors)
+            syslog(LOG_NOTICE, "connectivity restored after %ld seconds",
+                   (long)(time(NULL) - g_state.first_failure));
+    }
+    g_state.first_failure = 0;
+}
+
 static int classify_nfs_error(int rc)
 {
     if (g_state.safe_v4_mode && rc == -ERANGE)
@@ -473,11 +534,16 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
     int _retries = 0;                                                    \
     int _did_reconnect = 0;                                              \
     for (;;) {                                                           \
+        if (g_state.dead_triggered) { (rc) = -EIO; break; }              \
         pthread_mutex_lock(&g_state.meta_lock);                          \
         (rc) = (call);                                                   \
         pthread_mutex_unlock(&g_state.meta_lock);                        \
-        if ((rc) >= 0)                                                   \
+        if ((rc) >= 0) {                                                 \
+            dead_timeout_on_success();                                    \
             break;                                                       \
+        }                                                                \
+        dead_timeout_on_failure();                                       \
+        if (g_state.dead_triggered) { (rc) = -EIO; break; }              \
         int _cls = classify_nfs_error(rc);                               \
         if (_cls == RETRY_NONE || _retries >= NFS4_RETRY_MAX)            \
             break;                                                       \
@@ -806,9 +872,19 @@ static void *keepalive_thread_func(void *arg)
             break;
 
         pthread_mutex_lock(&g_state.meta_lock);
-        if (g_state.meta_nfs)
-            nfs_lstat64(g_state.meta_nfs, "/", &st);
+        if (g_state.meta_nfs) {
+            int ka_rc = nfs_lstat64(g_state.meta_nfs, "/", &st);
+            if (ka_rc < 0) {
+                dead_timeout_on_failure();
+                DBG(1, "nfsfuse: keepalive failed (rc=%d)\n", ka_rc);
+            } else {
+                dead_timeout_on_success();
+            }
+        }
         pthread_mutex_unlock(&g_state.meta_lock);
+
+        if (g_state.dead_triggered)
+            break;
 
         deferred_close_expire();
 
@@ -1058,9 +1134,14 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
             chunk = g_state.io_chunk;
 
         for (;;) {
+            if (g_state.dead_triggered) { rc = -EIO; break; }
             rc = CALL_NFS_PREAD(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
-            if (rc >= 0)
+            if (rc >= 0) {
+                dead_timeout_on_success();
                 break;
+            }
+            dead_timeout_on_failure();
+            if (g_state.dead_triggered) { rc = -EIO; break; }
             if (classify_nfs_error(rc) == RETRY_NONE ||
                 io_retries >= NFS4_RETRY_MAX)
                 break;
@@ -1109,9 +1190,14 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
             chunk = g_state.io_chunk;
 
         for (;;) {
+            if (g_state.dead_triggered) { rc = -EIO; break; }
             rc = CALL_NFS_PWRITE(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
-            if (rc >= 0)
+            if (rc >= 0) {
+                dead_timeout_on_success();
                 break;
+            }
+            dead_timeout_on_failure();
+            if (g_state.dead_triggered) { rc = -EIO; break; }
             if (classify_nfs_error(rc) == RETRY_NONE ||
                 io_retries >= NFS4_RETRY_MAX)
                 break;
@@ -2019,6 +2105,8 @@ static int nfuse_statfs(const char *path, struct statvfs *st)
 
 static void *nfuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 {
+    g_fuse_instance = fuse_get_context()->fuse;
+
     cfg->use_ino = 1;
     cfg->readdir_ino = 1;
 
@@ -2266,7 +2354,8 @@ static int is_nfsfuse_opt(const char *arg)
            strcmp(arg, "--retrans") == 0 ||
            strcmp(arg, "--autoreconnect") == 0 ||
            strcmp(arg, "--tcp-syncnt") == 0 ||
-           strcmp(arg, "--poll-timeout") == 0;
+           strcmp(arg, "--poll-timeout") == 0 ||
+           strcmp(arg, "--dead-timeout") == 0;
 }
 
 static int is_nfsfuse_opt_with_value(const char *arg)
@@ -2276,6 +2365,7 @@ static int is_nfsfuse_opt_with_value(const char *arg)
            strcmp(arg, "--autoreconnect") == 0 ||
            strcmp(arg, "--tcp-syncnt") == 0 ||
            strcmp(arg, "--poll-timeout") == 0 ||
+           strcmp(arg, "--dead-timeout") == 0 ||
            strcmp(arg, "--debug-output") == 0;
 }
 
@@ -2432,6 +2522,11 @@ int main(int argc, char *argv[])
             g_state.has_poll_timeout = 1;
             continue;
         }
+        if (strcmp(argv[i], "--dead-timeout") == 0 && i + 1 < argc) {
+            g_state.dead_timeout = atoi(argv[++i]);
+            g_state.has_dead_timeout = 1;
+            continue;
+        }
 
         if (url_idx == -1) {
             url_idx = i;
@@ -2470,6 +2565,9 @@ int main(int argc, char *argv[])
     g_state.fsname = build_fsname_from_url(g_state.url_base);
     if (g_state.fsname == NULL)
         g_state.fsname = xstrdup("nfsfuse");
+
+    if (g_state.has_dead_timeout)
+        DBG(1, "nfsfuse: dead-timeout=%ds\n", g_state.dead_timeout);
 
     DBG(1, "nfsfuse: mounting...\n");
 
