@@ -185,128 +185,13 @@ struct deferred_close_entry {
 static struct deferred_close_entry g_deferred[DEFERRED_CLOSE_MAX];
 static pthread_mutex_t g_deferred_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Forward declarations — implementations after g_state */
 static void deferred_close_add(const char *path, struct nfs_context *ctx,
-                               struct nfsfh *fh)
-{
-    int i, oldest = -1;
-    time_t oldest_time = 0;
-
-    pthread_mutex_lock(&g_deferred_lock);
-
-    /* Find a free slot or the oldest entry to evict */
-    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
-        if (!g_deferred[i].active) {
-            oldest = i;
-            break;
-        }
-        if (oldest < 0 || g_deferred[i].created < oldest_time) {
-            oldest = i;
-            oldest_time = g_deferred[i].created;
-        }
-    }
-
-    /* Evict oldest if needed */
-    if (g_deferred[oldest].active) {
-        DBG(2, "nfsfuse: deferred close evict %s\n", g_deferred[oldest].path);
-        pthread_mutex_lock(&g_state.meta_lock);
-        nfs_close(g_deferred[oldest].ctx, g_deferred[oldest].fh);
-        pthread_mutex_unlock(&g_state.meta_lock);
-    }
-
-    snprintf(g_deferred[oldest].path, sizeof(g_deferred[oldest].path),
-             "%s", path ? path : "");
-    g_deferred[oldest].ctx = ctx;
-    g_deferred[oldest].fh = fh;
-    g_deferred[oldest].created = time(NULL);
-    g_deferred[oldest].active = 1;
-
-    DBG(2, "nfsfuse: deferred close hold %s (slot %d)\n",
-        path ? path : "", oldest);
-
-    pthread_mutex_unlock(&g_deferred_lock);
-}
-
-/* Close a specific deferred entry by path (e.g., when the file is reopened) */
-static void deferred_close_release(const char *path)
-{
-    int i;
-
-    if (path == NULL)
-        return;
-
-    pthread_mutex_lock(&g_deferred_lock);
-    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
-        if (g_deferred[i].active && strcmp(g_deferred[i].path, path) == 0) {
-            DBG(2, "nfsfuse: deferred close release %s\n", path);
-            pthread_mutex_lock(&g_state.meta_lock);
-            nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
-            pthread_mutex_unlock(&g_state.meta_lock);
-            g_deferred[i].active = 0;
-        }
-    }
-    pthread_mutex_unlock(&g_deferred_lock);
-}
-
-/* Expire old deferred entries — called from keepalive thread */
-static void deferred_close_expire(void)
-{
-    int i;
-    time_t now = time(NULL);
-
-    pthread_mutex_lock(&g_deferred_lock);
-    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
-        if (g_deferred[i].active &&
-            (now - g_deferred[i].created) >= DEFERRED_CLOSE_SEC) {
-            DBG(2, "nfsfuse: deferred close expire %s\n", g_deferred[i].path);
-            pthread_mutex_lock(&g_state.meta_lock);
-            nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
-            pthread_mutex_unlock(&g_state.meta_lock);
-            g_deferred[i].active = 0;
-        }
-    }
-    pthread_mutex_unlock(&g_deferred_lock);
-}
-
-/* Close all deferred entries — called on shutdown */
-static void deferred_close_all(void)
-{
-    int i;
-
-    pthread_mutex_lock(&g_deferred_lock);
-    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
-        if (g_deferred[i].active) {
-            nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
-            g_deferred[i].active = 0;
-        }
-    }
-    pthread_mutex_unlock(&g_deferred_lock);
-}
-
-/*
- * Check if a deferred-close entry exists for a path and use fstat on
- * the held-open handle.  Returns 1 if found (and fills stbuf), 0 if not.
- */
-static int deferred_close_fstat(const char *path, struct nfs_stat_64 *st)
-{
-    int i, found = 0;
-
-    if (path == NULL)
-        return 0;
-
-    pthread_mutex_lock(&g_deferred_lock);
-    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
-        if (g_deferred[i].active && strcmp(g_deferred[i].path, path) == 0) {
-            pthread_mutex_lock(&g_state.meta_lock);
-            if (nfs_fstat64(g_deferred[i].ctx, g_deferred[i].fh, st) == 0)
-                found = 1;
-            pthread_mutex_unlock(&g_state.meta_lock);
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_deferred_lock);
-
-    return found;
-}
+                               struct nfsfh *fh);
+static void deferred_close_release(const char *path);
+static void deferred_close_expire(void);
+static void deferred_close_all(void);
+static int deferred_close_fstat(const char *path, struct nfs_stat_64 *st);
 
 struct dir_entry {
     char *name;
@@ -345,6 +230,124 @@ static int nfs_err_log(int rc, const char *op, const char *path,
 }
 
 static struct nfs_context *mount_new_context(const char *url);
+
+/* --- Deferred close function implementations --- */
+
+static void deferred_close_add(const char *path, struct nfs_context *ctx,
+                               struct nfsfh *fh)
+{
+    int i, oldest = -1;
+    time_t oldest_time = 0;
+
+    pthread_mutex_lock(&g_deferred_lock);
+
+    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
+        if (!g_deferred[i].active) {
+            oldest = i;
+            break;
+        }
+        if (oldest < 0 || g_deferred[i].created < oldest_time) {
+            oldest = i;
+            oldest_time = g_deferred[i].created;
+        }
+    }
+
+    if (g_deferred[oldest].active) {
+        DBG(2, "nfsfuse: deferred close evict %s\n", g_deferred[oldest].path);
+        pthread_mutex_lock(&g_state.meta_lock);
+        nfs_close(g_deferred[oldest].ctx, g_deferred[oldest].fh);
+        pthread_mutex_unlock(&g_state.meta_lock);
+    }
+
+    snprintf(g_deferred[oldest].path, sizeof(g_deferred[oldest].path),
+             "%s", path ? path : "");
+    g_deferred[oldest].ctx = ctx;
+    g_deferred[oldest].fh = fh;
+    g_deferred[oldest].created = time(NULL);
+    g_deferred[oldest].active = 1;
+
+    DBG(2, "nfsfuse: deferred close hold %s (slot %d)\n",
+        path ? path : "", oldest);
+
+    pthread_mutex_unlock(&g_deferred_lock);
+}
+
+static void deferred_close_release(const char *path)
+{
+    int i;
+
+    if (path == NULL)
+        return;
+
+    pthread_mutex_lock(&g_deferred_lock);
+    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
+        if (g_deferred[i].active && strcmp(g_deferred[i].path, path) == 0) {
+            DBG(2, "nfsfuse: deferred close release %s\n", path);
+            pthread_mutex_lock(&g_state.meta_lock);
+            nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
+            pthread_mutex_unlock(&g_state.meta_lock);
+            g_deferred[i].active = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_deferred_lock);
+}
+
+static void deferred_close_expire(void)
+{
+    int i;
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&g_deferred_lock);
+    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
+        if (g_deferred[i].active &&
+            (now - g_deferred[i].created) >= DEFERRED_CLOSE_SEC) {
+            DBG(2, "nfsfuse: deferred close expire %s\n", g_deferred[i].path);
+            pthread_mutex_lock(&g_state.meta_lock);
+            nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
+            pthread_mutex_unlock(&g_state.meta_lock);
+            g_deferred[i].active = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_deferred_lock);
+}
+
+static void deferred_close_all(void)
+{
+    int i;
+
+    pthread_mutex_lock(&g_deferred_lock);
+    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
+        if (g_deferred[i].active) {
+            nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
+            g_deferred[i].active = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_deferred_lock);
+}
+
+static int deferred_close_fstat(const char *path, struct nfs_stat_64 *st)
+{
+    int i, found = 0;
+
+    if (path == NULL)
+        return 0;
+
+    pthread_mutex_lock(&g_deferred_lock);
+    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
+        if (g_deferred[i].active && strcmp(g_deferred[i].path, path) == 0) {
+            pthread_mutex_lock(&g_state.meta_lock);
+            if (nfs_fstat64(g_deferred[i].ctx, g_deferred[i].fh, st) == 0)
+                found = 1;
+            pthread_mutex_unlock(&g_state.meta_lock);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_deferred_lock);
+
+    return found;
+}
+
+/* --- End deferred close implementations --- */
 
 /*
  * Classify NFS errors for retry strategy:
