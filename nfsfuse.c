@@ -2287,6 +2287,27 @@ static void *nfuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 {
     g_fuse_instance = fuse_get_context()->fuse;
 
+    /*
+     * Start background threads HERE, not in main().
+     * fuse_main() daemonizes (forks) before calling init, which kills
+     * any pthreads created earlier.  Threads started here survive.
+     */
+    if (g_state.safe_v4_mode) {
+        if (start_keepalive_thread() == 0)
+            DBG(1, "nfsfuse: NFS4 keepalive thread started\n");
+        else
+            DBG(1, "nfsfuse: WARNING: could not start keepalive thread\n");
+    }
+
+    if (g_state.has_dead_timeout && g_state.dead_timeout > 0) {
+        g_state.last_nfs_success = time(NULL);  /* healthy at startup */
+        if (start_dead_timeout_watchdog() == 0)
+            DBG(1, "nfsfuse: dead-timeout watchdog thread started (%ds)\n",
+                g_state.dead_timeout);
+        else
+            DBG(1, "nfsfuse: WARNING: could not start watchdog thread\n");
+    }
+
     cfg->use_ino = 1;
     cfg->readdir_ino = 1;
 
@@ -2868,22 +2889,12 @@ int main(int argc, char *argv[])
             DBG(1, "  argv[%d]=%s\n", i, fuse_argv[i]);
     }
 
-    if (g_state.safe_v4_mode) {
-        if (start_keepalive_thread() == 0)
-            DBG(1, "nfsfuse: NFS4 keepalive thread started\n");
-        else
-            fprintf(stderr, "nfsfuse: warning: could not start keepalive thread\n");
-    }
-
-    if (g_state.has_dead_timeout && g_state.dead_timeout > 0) {
-        g_state.last_nfs_success = time(NULL);  /* healthy at startup */
-        if (start_dead_timeout_watchdog() == 0)
-            DBG(1, "nfsfuse: dead-timeout watchdog thread started (%ds)\n",
-                g_state.dead_timeout);
-        else
-            fprintf(stderr, "nfsfuse: warning: could not start "
-                            "dead-timeout watchdog thread\n");
-    }
+    /*
+     * NOTE: threads are started in nfuse_init(), not here.
+     * fuse_main() daemonizes (forks) by default, which destroys all
+     * pthreads.  nfuse_init() runs after daemonization, so threads
+     * created there survive.
+     */
 
     rc = fuse_main(fuse_argc, fuse_argv, &nfuse_ops, NULL);
 
