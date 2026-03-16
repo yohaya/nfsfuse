@@ -192,6 +192,8 @@ static void deferred_close_release(const char *path);
 static void deferred_close_expire(void);
 static void deferred_close_all(void);
 static int deferred_close_fstat(const char *path, struct nfs_stat_64 *st);
+static int deferred_close_take(const char *path, struct nfs_context **out_ctx,
+                               struct nfsfh **out_fh);
 
 struct dir_entry {
     char *name;
@@ -339,6 +341,35 @@ static int deferred_close_fstat(const char *path, struct nfs_stat_64 *st)
             if (nfs_fstat64(g_deferred[i].ctx, g_deferred[i].fh, st) == 0)
                 found = 1;
             pthread_mutex_unlock(&g_state.meta_lock);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_deferred_lock);
+
+    return found;
+}
+
+/*
+ * Extract a deferred handle from the pool, removing it.  Returns 1 if
+ * found (and fills out_ctx/out_fh), 0 if not.  The caller takes
+ * ownership of the NFS handle and must close it.
+ */
+static int deferred_close_take(const char *path, struct nfs_context **out_ctx,
+                               struct nfsfh **out_fh)
+{
+    int i, found = 0;
+
+    if (path == NULL)
+        return 0;
+
+    pthread_mutex_lock(&g_deferred_lock);
+    for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
+        if (g_deferred[i].active && strcmp(g_deferred[i].path, path) == 0) {
+            *out_ctx = g_deferred[i].ctx;
+            *out_fh = g_deferred[i].fh;
+            g_deferred[i].active = 0;
+            found = 1;
+            DBG(2, "nfsfuse: deferred close take %s\n", path);
             break;
         }
     }
@@ -1394,9 +1425,13 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
     DBG(2, "nfsfuse: open %s\n", path ? path : "(null)");
     DBG(3, "nfsfuse: open %s flags=0x%x\n", path ? path : "(null)", flags);
 
-    /* Release any deferred close for this path before opening fresh */
-    deferred_close_release(path);
-
+    /*
+     * Do NOT release the deferred close before the open attempt.
+     * The deferred handle keeps the NFS4 OPEN state alive on the
+     * server.  If we close it first and the server evicted the file
+     * from its name cache, the fresh open will fail with ENOENT.
+     * Only release after the fresh open succeeds.
+     */
     {
         int retries = 0, did_reconnect = 0;
         for (;;) {
@@ -1419,6 +1454,51 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
             }
         }
     }
+
+    if (rc >= 0) {
+        /* Fresh open succeeded — release the deferred handle */
+        deferred_close_release(path);
+    } else if (rc == -ENOENT) {
+        /*
+         * Fresh open failed with ENOENT but we may have a deferred
+         * handle.  Take it from the pool and promote it into a proper
+         * file_handle for FUSE.  The file exists on the server (we
+         * have an open stateid) but path-based LOOKUP fails — this
+         * is the ISO disappearance bug.
+         */
+        struct nfs_context *dc_ctx = NULL;
+        struct nfsfh *dc_fh = NULL;
+
+        if (deferred_close_take(path, &dc_ctx, &dc_fh)) {
+            DBG(1, "nfsfuse: open %s — promoting deferred handle\n",
+                path ? path : "");
+            if (g_log_errors)
+                syslog(LOG_NOTICE, "open %s — promoting deferred handle",
+                       path ? path : "");
+
+            h = calloc(1, sizeof(*h));
+            if (h != NULL) {
+                h->ctx = dc_ctx;
+                h->fh = dc_fh;
+                h->own_ctx = 0;
+                h->writable = 0;
+                if (pthread_mutex_init(&h->lock, NULL) == 0) {
+                    rc = 0;  /* success — using promoted handle */
+                } else {
+                    pthread_mutex_lock(&g_state.meta_lock);
+                    nfs_close(dc_ctx, dc_fh);
+                    pthread_mutex_unlock(&g_state.meta_lock);
+                    free(h);
+                    h = NULL;
+                }
+            } else {
+                pthread_mutex_lock(&g_state.meta_lock);
+                nfs_close(dc_ctx, dc_fh);
+                pthread_mutex_unlock(&g_state.meta_lock);
+            }
+        }
+    }
+
     if (rc < 0)
         return rc;
 
