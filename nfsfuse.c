@@ -156,6 +156,7 @@ struct file_handle {
     pthread_mutex_t lock;
     int own_ctx;
     int writable;
+    int borrowed;  /* 1 = NFS handle is owned by deferred pool, don't close */
 };
 
 /*
@@ -192,7 +193,7 @@ static void deferred_close_release(const char *path);
 static void deferred_close_expire(void);
 static void deferred_close_all(void);
 static int deferred_close_fstat(const char *path, struct nfs_stat_64 *st);
-static int deferred_close_take(const char *path, struct nfs_context **out_ctx,
+static int deferred_close_peek(const char *path, struct nfs_context **out_ctx,
                                struct nfsfh **out_fh);
 
 struct dir_entry {
@@ -350,11 +351,13 @@ static int deferred_close_fstat(const char *path, struct nfs_stat_64 *st)
 }
 
 /*
- * Extract a deferred handle from the pool, removing it.  Returns 1 if
- * found (and fills out_ctx/out_fh), 0 if not.  The caller takes
- * ownership of the NFS handle and must close it.
+ * Peek at a deferred handle — return the ctx/fh for use by the caller
+ * WITHOUT removing from the pool.  The entry stays active so that
+ * subsequent getattr calls can still recover via deferred_close_fstat.
+ * The caller must NOT close the returned handle — it is still owned
+ * by the pool and will be closed by release/expire/shutdown.
  */
-static int deferred_close_take(const char *path, struct nfs_context **out_ctx,
+static int deferred_close_peek(const char *path, struct nfs_context **out_ctx,
                                struct nfsfh **out_fh)
 {
     int i, found = 0;
@@ -367,9 +370,8 @@ static int deferred_close_take(const char *path, struct nfs_context **out_ctx,
         if (g_deferred[i].active && strcmp(g_deferred[i].path, path) == 0) {
             *out_ctx = g_deferred[i].ctx;
             *out_fh = g_deferred[i].fh;
-            g_deferred[i].active = 0;
             found = 1;
-            DBG(2, "nfsfuse: deferred close take %s\n", path);
+            DBG(2, "nfsfuse: deferred close peek %s\n", path);
             break;
         }
     }
@@ -1461,15 +1463,16 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
     } else if (rc == -ENOENT) {
         /*
          * Fresh open failed with ENOENT but we may have a deferred
-         * handle.  Take it from the pool and promote it into a proper
-         * file_handle for FUSE.  The file exists on the server (we
-         * have an open stateid) but path-based LOOKUP fails — this
-         * is the ISO disappearance bug.
+         * handle.  Peek at it (don't remove from pool!) and create a
+         * file_handle that shares the NFS handle.  The pool keeps its
+         * entry active so that subsequent getattr calls still recover
+         * via deferred_close_fstat.  The pool owns the NFS handle —
+         * the promoted file_handle must NOT close it on release.
          */
         struct nfs_context *dc_ctx = NULL;
         struct nfsfh *dc_fh = NULL;
 
-        if (deferred_close_take(path, &dc_ctx, &dc_fh)) {
+        if (deferred_close_peek(path, &dc_ctx, &dc_fh)) {
             DBG(1, "nfsfuse: open %s — promoting deferred handle\n",
                 path ? path : "");
             if (g_log_errors)
@@ -1482,19 +1485,13 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
                 h->fh = dc_fh;
                 h->own_ctx = 0;
                 h->writable = 0;
+                h->borrowed = 1;  /* pool owns the NFS handle */
                 if (pthread_mutex_init(&h->lock, NULL) == 0) {
                     rc = 0;  /* success — using promoted handle */
                 } else {
-                    pthread_mutex_lock(&g_state.meta_lock);
-                    nfs_close(dc_ctx, dc_fh);
-                    pthread_mutex_unlock(&g_state.meta_lock);
                     free(h);
                     h = NULL;
                 }
-            } else {
-                pthread_mutex_lock(&g_state.meta_lock);
-                nfs_close(dc_ctx, dc_fh);
-                pthread_mutex_unlock(&g_state.meta_lock);
             }
         }
     }
@@ -1589,7 +1586,10 @@ static int nfuse_release(const char *path, struct fuse_file_info *fi)
      * client's close-to-open consistency behavior.  Only for writable
      * files on the shared context (the ISO creation path).
      */
-    if (h->writable && !h->own_ctx && g_state.safe_v4_mode && path) {
+    if (h->borrowed) {
+        /* Promoted from deferred pool — pool owns the NFS handle */
+        file_handle_unlock(h);
+    } else if (h->writable && !h->own_ctx && g_state.safe_v4_mode && path) {
         file_handle_unlock(h);
         deferred_close_add(path, file_handle_ctx(h), h->fh);
         /* Don't close the NFS handle — it's now owned by deferred pool */
