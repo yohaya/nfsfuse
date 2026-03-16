@@ -798,17 +798,21 @@ static int start_keepalive_thread(void)
 
 static void stop_keepalive_thread(void)
 {
-    pthread_t tid;
-
     if (!g_state.keepalive_running)
         return;
 
     g_state.keepalive_running = 0;
-    tid = g_state.keepalive_thread;
-    g_state.keepalive_thread = 0;
 
-    if (tid)
-        pthread_join(tid, NULL);
+    /*
+     * Don't pthread_join — the thread may be blocked in nfs_lstat64()
+     * for up to 60 seconds (NFS timeout).  Detach it so the process
+     * can exit immediately.  The thread will be killed when the process
+     * exits.
+     */
+    if (g_state.keepalive_thread) {
+        pthread_detach(g_state.keepalive_thread);
+        g_state.keepalive_thread = 0;
+    }
 }
 
 static void cleanup_app_state(void)
@@ -2002,17 +2006,34 @@ static void *nfuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
     return NULL;
 }
 
+/*
+ * Watchdog thread: if the process hasn't exited within a few seconds
+ * of unmount, force-exit.  NFS calls (nfs_close, nfs_lstat64) can
+ * block for up to 60 seconds on a dead server, preventing clean exit.
+ */
+static void *exit_watchdog(void *arg)
+{
+    (void)arg;
+    sleep(5);
+    DBG(1, "nfsfuse: exit watchdog — forcing exit\n");
+    if (g_log_errors)
+        syslog(LOG_NOTICE, "exit watchdog — forcing exit after unmount");
+    _exit(0);
+    return NULL;
+}
+
 static void nfuse_destroy(void *private_data)
 {
+    pthread_t wd;
+
     (void)private_data;
 
-    /*
-     * Signal threads to stop but do NOT call cleanup_app_state() here.
-     * cleanup_app_state() is called after fuse_main() returns in main().
-     * Calling it here too would double-free resources and double-join
-     * threads.  Just stop the keepalive thread and release deferred
-     * handles so the NFS connection can disconnect cleanly.
-     */
+    DBG(1, "nfsfuse: unmount — cleaning up\n");
+
+    /* Start a watchdog that force-exits after 5 seconds */
+    if (pthread_create(&wd, NULL, exit_watchdog, NULL) == 0)
+        pthread_detach(wd);
+
     stop_keepalive_thread();
     deferred_close_all();
 }
