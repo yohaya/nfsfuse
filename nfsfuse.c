@@ -757,7 +757,14 @@ static void *keepalive_thread_func(void *arg)
     (void)arg;
 
     while (g_state.keepalive_running) {
-        sleep(30);
+        /*
+         * Use short sleeps so the thread can exit promptly on unmount.
+         * Total cycle is ~30 seconds (60 * 0.5s) but we check the
+         * running flag every half second.
+         */
+        int i;
+        for (i = 0; i < 60 && g_state.keepalive_running; i++)
+            usleep(500000);
 
         if (!g_state.keepalive_running)
             break;
@@ -788,10 +795,17 @@ static int start_keepalive_thread(void)
 
 static void stop_keepalive_thread(void)
 {
-    if (g_state.keepalive_running) {
-        g_state.keepalive_running = 0;
-        pthread_join(g_state.keepalive_thread, NULL);
-    }
+    pthread_t tid;
+
+    if (!g_state.keepalive_running)
+        return;
+
+    g_state.keepalive_running = 0;
+    tid = g_state.keepalive_thread;
+    g_state.keepalive_thread = 0;
+
+    if (tid)
+        pthread_join(tid, NULL);
 }
 
 static void cleanup_app_state(void)
@@ -1988,7 +2002,16 @@ static void *nfuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 static void nfuse_destroy(void *private_data)
 {
     (void)private_data;
-    cleanup_app_state();
+
+    /*
+     * Signal threads to stop but do NOT call cleanup_app_state() here.
+     * cleanup_app_state() is called after fuse_main() returns in main().
+     * Calling it here too would double-free resources and double-join
+     * threads.  Just stop the keepalive thread and release deferred
+     * handles so the NFS connection can disconnect cleanly.
+     */
+    stop_keepalive_thread();
+    deferred_close_all();
 }
 
 static struct fuse_operations nfuse_ops = {
