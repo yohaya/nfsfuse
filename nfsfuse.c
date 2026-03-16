@@ -1072,7 +1072,24 @@ static void *dead_timeout_watchdog_func(void *arg)
         }
     }
 
-    DBG(1, "nfsfuse: dead-timeout watchdog thread exiting\n");
+    /*
+     * fuse_exit() only sets a flag — it cannot interrupt the stuck NFS
+     * call, so the FUSE event loop stays blocked and the kernel mount
+     * stays registered.  Any process accessing the mount point (df,
+     * ls, lsof) will hang in uninterruptible kernel sleep.
+     *
+     * Force-kill the process after a short grace period.  When the
+     * FUSE daemon dies, the kernel returns -ENOTCONN / -EIO to all
+     * pending and future operations on the mount.
+     */
+    DBG(1, "nfsfuse: dead-watchdog: waiting 3s then force-exiting\n");
+    if (g_log_errors)
+        syslog(LOG_CRIT, "dead-timeout: force-exiting in 3 seconds");
+    sleep(3);
+    DBG(1, "nfsfuse: dead-watchdog: force exit now\n");
+    _exit(1);
+
+    /* not reached */
     return NULL;
 }
 
