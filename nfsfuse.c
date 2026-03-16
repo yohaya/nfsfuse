@@ -326,10 +326,14 @@ static void deferred_close_expire(void)
         if (g_deferred[i].active &&
             (now - g_deferred[i].created) >= DEFERRED_CLOSE_SEC) {
             DBG(2, "nfsfuse: deferred close expire %s\n", g_deferred[i].path);
-            pthread_mutex_lock(&g_state.meta_lock);
-            nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
-            pthread_mutex_unlock(&g_state.meta_lock);
-            g_deferred[i].active = 0;
+            if (pthread_mutex_trylock(&g_state.meta_lock) == 0) {
+                nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
+                pthread_mutex_unlock(&g_state.meta_lock);
+                g_deferred[i].active = 0;
+            } else {
+                DBG(3, "nfsfuse: deferred close: meta_lock busy, "
+                       "skipping %s\n", g_deferred[i].path);
+            }
         }
     }
     pthread_mutex_unlock(&g_deferred_lock);
@@ -876,11 +880,14 @@ static void *keepalive_thread_func(void *arg)
     while (g_state.keepalive_running) {
         /*
          * Use short sleeps so the thread can exit promptly on unmount.
-         * Total cycle is ~30 seconds (60 * 0.5s) but we check the
-         * running flag every half second.
+         * Normal cycle: ~30 seconds (60 * 0.5s).
+         * When dead-timeout failure tracking is active: ~5 seconds
+         * (10 * 0.5s) so the watchdog can advance the counter faster.
          */
+        int cycles = (g_state.has_dead_timeout && g_state.first_failure != 0)
+                     ? 10 : 60;
         int i;
-        for (i = 0; i < 60 && g_state.keepalive_running; i++)
+        for (i = 0; i < cycles && g_state.keepalive_running; i++)
             usleep(500000);
 
         if (!g_state.keepalive_running)
@@ -891,10 +898,11 @@ static void *keepalive_thread_func(void *arg)
             time_t now = time(NULL);
             long elapsed = g_state.first_failure
                            ? (long)(now - g_state.first_failure) : 0;
-            DBG(3, "nfsfuse: watchdog: dead_timeout=%ds first_failure=%ld "
-                   "elapsed=%lds dead_triggered=%d\n",
+            DBG(3, "nfsfuse: watchdog tick: dead_timeout=%ds "
+                   "first_failure=%ld elapsed=%lds dead_triggered=%d "
+                   "cycle=%ds\n",
                 g_state.dead_timeout, (long)g_state.first_failure,
-                elapsed, g_state.dead_triggered);
+                elapsed, g_state.dead_triggered, cycles / 2);
         }
 
         /*
@@ -903,15 +911,22 @@ static void *keepalive_thread_func(void *arg)
          * still need to advance the dead-timeout counter — otherwise
          * the watchdog is completely blocked and can never trigger the
          * unmount.
+         *
+         * When trylock succeeds, nfs_lstat64() may still block for up
+         * to timeout*retrans ms on a dead server, but it will
+         * eventually return an error and dead_timeout_on_failure()
+         * will be called.
          */
         if (pthread_mutex_trylock(&g_state.meta_lock) == 0) {
             if (g_state.meta_nfs) {
+                DBG(3, "nfsfuse: watchdog: calling nfs_lstat64...\n");
                 int ka_rc = nfs_lstat64(g_state.meta_nfs, "/", &st);
                 if (ka_rc < 0) {
                     dead_timeout_on_failure();
                     DBG(1, "nfsfuse: keepalive failed (rc=%d)\n", ka_rc);
                 } else {
                     dead_timeout_on_success();
+                    DBG(3, "nfsfuse: watchdog: keepalive OK\n");
                 }
             }
             pthread_mutex_unlock(&g_state.meta_lock);
@@ -927,9 +942,11 @@ static void *keepalive_thread_func(void *arg)
 
         deferred_close_expire();
 
-        DBG(3, "nfsfuse: watchdog: keepalive cycle complete\n");
+        DBG(3, "nfsfuse: watchdog: cycle complete\n");
     }
 
+    DBG(1, "nfsfuse: keepalive thread exiting (dead_triggered=%d)\n",
+        g_state.dead_triggered);
     return NULL;
 }
 
