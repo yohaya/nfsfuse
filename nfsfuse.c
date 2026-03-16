@@ -78,12 +78,27 @@ static int g_reconnect_on_stale = 0;
 static FILE *g_debug_file = NULL;  /* non-NULL = write debug to file */
 static int g_debug_syslog = 0;    /* 1 = write debug to syslog */
 
+static void dbg_print_timestamp(FILE *fp)
+{
+    struct timeval tv;
+    struct tm tm;
+    gettimeofday(&tv, NULL);
+    localtime_r(&tv.tv_sec, &tm);
+    fprintf(fp, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+            tm.tm_hour, tm.tm_min, tm.tm_sec,
+            (int)(tv.tv_usec / 1000));
+}
+
 #define DBG(lvl, ...) do { \
     if (g_debug >= (lvl)) { \
         if (g_debug_syslog) \
             syslog(LOG_DEBUG, __VA_ARGS__); \
-        else \
-            fprintf(g_debug_file ? g_debug_file : stderr, __VA_ARGS__); \
+        else { \
+            FILE *_dbg_fp = g_debug_file ? g_debug_file : stderr; \
+            dbg_print_timestamp(_dbg_fp); \
+            fprintf(_dbg_fp, __VA_ARGS__); \
+        } \
     } \
 } while (0)
 
@@ -871,24 +886,48 @@ static void *keepalive_thread_func(void *arg)
         if (!g_state.keepalive_running)
             break;
 
-        pthread_mutex_lock(&g_state.meta_lock);
-        if (g_state.meta_nfs) {
-            int ka_rc = nfs_lstat64(g_state.meta_nfs, "/", &st);
-            if (ka_rc < 0) {
-                dead_timeout_on_failure();
-                DBG(1, "nfsfuse: keepalive failed (rc=%d)\n", ka_rc);
-            } else {
-                dead_timeout_on_success();
-            }
+        /* Log dead-timeout watchdog status at level 3 */
+        if (g_state.has_dead_timeout) {
+            time_t now = time(NULL);
+            long elapsed = g_state.first_failure
+                           ? (long)(now - g_state.first_failure) : 0;
+            DBG(3, "nfsfuse: watchdog: dead_timeout=%ds first_failure=%ld "
+                   "elapsed=%lds dead_triggered=%d\n",
+                g_state.dead_timeout, (long)g_state.first_failure,
+                elapsed, g_state.dead_triggered);
         }
-        pthread_mutex_unlock(&g_state.meta_lock);
+
+        /*
+         * Try to acquire the meta lock without blocking.  If the lock
+         * is held (e.g. a write is stuck in a blocking NFS call), we
+         * still need to advance the dead-timeout counter — otherwise
+         * the watchdog is completely blocked and can never trigger the
+         * unmount.
+         */
+        if (pthread_mutex_trylock(&g_state.meta_lock) == 0) {
+            if (g_state.meta_nfs) {
+                int ka_rc = nfs_lstat64(g_state.meta_nfs, "/", &st);
+                if (ka_rc < 0) {
+                    dead_timeout_on_failure();
+                    DBG(1, "nfsfuse: keepalive failed (rc=%d)\n", ka_rc);
+                } else {
+                    dead_timeout_on_success();
+                }
+            }
+            pthread_mutex_unlock(&g_state.meta_lock);
+        } else {
+            /* Lock held — another thread is stuck in an NFS call */
+            DBG(3, "nfsfuse: watchdog: meta_lock busy, "
+                   "NFS call likely stuck — treating as failure\n");
+            dead_timeout_on_failure();
+        }
 
         if (g_state.dead_triggered)
             break;
 
         deferred_close_expire();
 
-        DBG(3, "nfsfuse: keepalive tick\n");
+        DBG(3, "nfsfuse: watchdog: keepalive cycle complete\n");
     }
 
     return NULL;
