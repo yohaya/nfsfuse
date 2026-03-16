@@ -169,6 +169,17 @@ struct app_state {
     int has_dead_timeout;
     time_t first_failure;    /* monotonic time of first consecutive failure, 0 = healthy */
     int dead_triggered;      /* 1 = already triggered unmount */
+
+    /*
+     * Lock-free timestamps for the dedicated watchdog thread.
+     * volatile ensures visibility across threads without a mutex.
+     * Updated by I/O threads; read by the watchdog thread.
+     */
+    volatile time_t last_nfs_success;  /* last successful NFS op, 0 = none yet */
+    volatile time_t nfs_call_start;    /* when current NFS call started, 0 = idle */
+
+    pthread_t watchdog_thread;
+    int watchdog_running;
 };
 
 struct file_handle {
@@ -468,6 +479,8 @@ static void dead_timeout_on_failure(void)
 
 static void dead_timeout_on_success(void)
 {
+    g_state.last_nfs_success = time(NULL);
+
     if (g_state.dead_timeout <= 0)
         return;
 
@@ -555,7 +568,9 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
     for (;;) {                                                           \
         if (g_state.dead_triggered) { (rc) = -EIO; break; }              \
         pthread_mutex_lock(&g_state.meta_lock);                          \
+        g_state.nfs_call_start = time(NULL);                             \
         (rc) = (call);                                                   \
+        g_state.nfs_call_start = 0;                                      \
         pthread_mutex_unlock(&g_state.meta_lock);                        \
         if ((rc) >= 0) {                                                 \
             dead_timeout_on_success();                                    \
@@ -980,8 +995,113 @@ static void stop_keepalive_thread(void)
     }
 }
 
+/*
+ * Dedicated dead-timeout watchdog thread.
+ *
+ * This thread does NO NFS calls and acquires NO mutexes.  It reads
+ * only volatile timestamps set by the I/O threads and calls fuse_exit()
+ * when the server has been unresponsive for dead_timeout seconds.
+ *
+ * This is necessary because the keepalive thread can itself be blocked:
+ * - On meta_lock (held by a stuck write/read)
+ * - On nfs_lstat64() (TCP socket stuck on dead server)
+ * - On deferred_close_expire() (same lock issue)
+ *
+ * The watchdog detects two conditions:
+ * 1. An NFS call has been in-flight for >= dead_timeout seconds
+ *    (nfs_call_start != 0 and too old)
+ * 2. No successful NFS operation for >= dead_timeout seconds
+ *    (last_nfs_success != 0 and too old)
+ */
+static void *dead_timeout_watchdog_func(void *arg)
+{
+    (void)arg;
+
+    DBG(1, "nfsfuse: dead-timeout watchdog thread started "
+           "(timeout=%ds, checking every 2s)\n", g_state.dead_timeout);
+
+    while (g_state.watchdog_running && !g_state.dead_triggered) {
+        /* Sleep 2 seconds in short increments for prompt exit */
+        int i;
+        for (i = 0; i < 4 && g_state.watchdog_running; i++)
+            usleep(500000);
+
+        if (!g_state.watchdog_running)
+            break;
+
+        time_t now = time(NULL);
+        time_t call_start = g_state.nfs_call_start;
+        time_t last_success = g_state.last_nfs_success;
+
+        long call_age = (call_start != 0) ? (long)(now - call_start) : 0;
+        long since_success = (last_success != 0) ? (long)(now - last_success) : 0;
+
+        DBG(3, "nfsfuse: dead-watchdog: call_in_flight=%s call_age=%lds "
+               "since_last_success=%lds dead_triggered=%d\n",
+            call_start ? "yes" : "no", call_age,
+            since_success, g_state.dead_triggered);
+
+        /* Condition 1: NFS call stuck for >= dead_timeout */
+        if (call_start != 0 && call_age >= g_state.dead_timeout) {
+            g_state.dead_triggered = 1;
+            DBG(1, "nfsfuse: dead-watchdog: NFS call stuck for %lds "
+                   "(limit %ds) — triggering unmount\n",
+                call_age, g_state.dead_timeout);
+            if (g_log_errors)
+                syslog(LOG_CRIT,
+                       "NFS call stuck for %ld seconds — unmounting",
+                       call_age);
+            if (g_fuse_instance)
+                fuse_exit(g_fuse_instance);
+            break;
+        }
+
+        /* Condition 2: no successful NFS op for >= dead_timeout */
+        if (last_success != 0 && since_success >= g_state.dead_timeout) {
+            g_state.dead_triggered = 1;
+            DBG(1, "nfsfuse: dead-watchdog: no NFS success for %lds "
+                   "(limit %ds) — triggering unmount\n",
+                since_success, g_state.dead_timeout);
+            if (g_log_errors)
+                syslog(LOG_CRIT,
+                       "no successful NFS operation for %ld seconds "
+                       "— unmounting", since_success);
+            if (g_fuse_instance)
+                fuse_exit(g_fuse_instance);
+            break;
+        }
+    }
+
+    DBG(1, "nfsfuse: dead-timeout watchdog thread exiting\n");
+    return NULL;
+}
+
+static int start_dead_timeout_watchdog(void)
+{
+    g_state.watchdog_running = 1;
+    if (pthread_create(&g_state.watchdog_thread, NULL,
+                       dead_timeout_watchdog_func, NULL) != 0) {
+        g_state.watchdog_running = 0;
+        return -1;
+    }
+    return 0;
+}
+
+static void stop_dead_timeout_watchdog(void)
+{
+    if (!g_state.watchdog_running)
+        return;
+    g_state.watchdog_running = 0;
+    /* Detach — thread uses only volatile reads and will exit promptly */
+    if (g_state.watchdog_thread) {
+        pthread_detach(g_state.watchdog_thread);
+        g_state.watchdog_thread = 0;
+    }
+}
+
 static void cleanup_app_state(void)
 {
+    stop_dead_timeout_watchdog();
     stop_keepalive_thread();
     deferred_close_all();
 
@@ -1191,7 +1311,9 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
 
         for (;;) {
             if (g_state.dead_triggered) { rc = -EIO; break; }
+            g_state.nfs_call_start = time(NULL);
             rc = CALL_NFS_PREAD(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
+            g_state.nfs_call_start = 0;
             if (rc >= 0) {
                 dead_timeout_on_success();
                 break;
@@ -1247,7 +1369,9 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
 
         for (;;) {
             if (g_state.dead_triggered) { rc = -EIO; break; }
+            g_state.nfs_call_start = time(NULL);
             rc = CALL_NFS_PWRITE(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
+            g_state.nfs_call_start = 0;
             if (rc >= 0) {
                 dead_timeout_on_success();
                 break;
@@ -2749,6 +2873,16 @@ int main(int argc, char *argv[])
             DBG(1, "nfsfuse: NFS4 keepalive thread started\n");
         else
             fprintf(stderr, "nfsfuse: warning: could not start keepalive thread\n");
+    }
+
+    if (g_state.has_dead_timeout && g_state.dead_timeout > 0) {
+        g_state.last_nfs_success = time(NULL);  /* healthy at startup */
+        if (start_dead_timeout_watchdog() == 0)
+            DBG(1, "nfsfuse: dead-timeout watchdog thread started (%ds)\n",
+                g_state.dead_timeout);
+        else
+            fprintf(stderr, "nfsfuse: warning: could not start "
+                            "dead-timeout watchdog thread\n");
     }
 
     rc = fuse_main(fuse_argc, fuse_argv, &nfuse_ops, NULL);
