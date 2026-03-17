@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
@@ -1073,20 +1074,50 @@ static void *dead_timeout_watchdog_func(void *arg)
     }
 
     /*
-     * fuse_exit() only sets a flag — it cannot interrupt the stuck NFS
-     * call, so the FUSE event loop stays blocked and the kernel mount
-     * stays registered.  Any process accessing the mount point (df,
-     * ls, lsof) will hang in uninterruptible kernel sleep.
+     * Shut down the NFS TCP socket to unblock the stuck libnfs call.
+     * shutdown() on a socket causes any blocking recv()/send()/poll()
+     * on that socket to return immediately with an error.  This is
+     * safe to call from any thread without holding meta_lock.
      *
-     * Force-kill the process after a short grace period.  When the
-     * FUSE daemon dies, the kernel returns -ENOTCONN / -EIO to all
-     * pending and future operations on the mount.
+     * After the stuck call returns an error, the FUSE I/O path sees
+     * dead_triggered=1 and returns -EIO through the normal FUSE
+     * response path.  The kernel delivers -EIO to the application
+     * (e.g. QEMU), which handles EIO much better than ENOTCONN
+     * (which is what happens if the FUSE daemon just _exit()s).
      */
-    DBG(1, "nfsfuse: dead-watchdog: waiting 3s then force-exiting\n");
+    if (g_state.meta_nfs) {
+        int nfs_fd = nfs_get_fd(g_state.meta_nfs);
+        if (nfs_fd >= 0) {
+            DBG(1, "nfsfuse: dead-watchdog: shutting down NFS socket "
+                   "(fd=%d) to unblock stuck call\n", nfs_fd);
+            shutdown(nfs_fd, SHUT_RDWR);
+        }
+    }
+
     if (g_log_errors)
-        syslog(LOG_CRIT, "dead-timeout: force-exiting in 3 seconds");
-    sleep(3);
-    DBG(1, "nfsfuse: dead-watchdog: force exit now\n");
+        syslog(LOG_CRIT, "dead-timeout: NFS socket shut down, "
+                          "returning EIO to applications");
+
+    /*
+     * Wait for the FUSE thread to process the error and exit the
+     * event loop.  If it doesn't exit within 10 seconds (e.g. the
+     * socket shutdown didn't unblock the call), force-exit as a
+     * safety net.
+     */
+    DBG(1, "nfsfuse: dead-watchdog: waiting up to 10s for "
+           "graceful shutdown\n");
+    {
+        int i;
+        for (i = 0; i < 20; i++) {
+            usleep(500000);
+            if (!g_state.keepalive_running)
+                break;  /* nfuse_destroy ran — clean exit happening */
+        }
+    }
+
+    DBG(1, "nfsfuse: dead-watchdog: force exit (safety net)\n");
+    if (g_log_errors)
+        syslog(LOG_CRIT, "dead-timeout: force-exiting");
     _exit(1);
 
     /* not reached */
