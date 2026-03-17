@@ -76,6 +76,7 @@ static int g_noatime = 0;
 static int g_nodiratime = 0;
 static int g_noexec = 0;
 static int g_reconnect_on_stale = 0;
+static int g_writeback_cache = 0;
 static FILE *g_debug_file = NULL;  /* non-NULL = write debug to file */
 static int g_debug_syslog = 0;    /* 1 = write debug to syslog */
 
@@ -2382,6 +2383,11 @@ static void *nfuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
                 conn->congestion_threshold = 12;
         }
 
+        if (g_writeback_cache && (conn->capable & FUSE_CAP_WRITEBACK_CACHE)) {
+            conn->want |= FUSE_CAP_WRITEBACK_CACHE;
+            DBG(1, "nfsfuse: writeback cache enabled (NFSv4)\n");
+        }
+
         return NULL;
     }
 
@@ -2424,6 +2430,10 @@ static void *nfuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
             conn->want |= FUSE_CAP_ASYNC_READ;
         if (conn->capable & FUSE_CAP_ATOMIC_O_TRUNC)
             conn->want |= FUSE_CAP_ATOMIC_O_TRUNC;
+        if (g_writeback_cache && (conn->capable & FUSE_CAP_WRITEBACK_CACHE)) {
+            conn->want |= FUSE_CAP_WRITEBACK_CACHE;
+            DBG(1, "nfsfuse: writeback cache enabled (NFSv3 max)\n");
+        }
     } else {
         cfg->auto_cache = 1;
         cfg->ac_attr_timeout_set = 1;
@@ -2526,6 +2536,8 @@ static void usage(const char *prog)
         "  --nodiratime         Do not update directory access time\n"
         "  --noexec             Disallow execution of binaries on mount\n"
         "  --reconnect-on-stale Auto-reconnect on stale file handle (ESTALE)\n"
+        "  --writeback-cache    Enable kernel writeback cache (faster writes,\n"
+        "                       risk of data loss on crash — see docs)\n"
         "  --version            Show version information\n\n"
         "Timeout and retry options:\n"
         "  --timeout <ms>       RPC request timeout in milliseconds (default: 10000)\n"
@@ -2613,6 +2625,7 @@ static int is_nfsfuse_opt(const char *arg)
            strcmp(arg, "--nodiratime") == 0 ||
            strcmp(arg, "--noexec") == 0 ||
            strcmp(arg, "--reconnect-on-stale") == 0 ||
+           strcmp(arg, "--writeback-cache") == 0 ||
            strcmp(arg, "--timeout") == 0 ||
            strcmp(arg, "--retrans") == 0 ||
            strcmp(arg, "--autoreconnect") == 0 ||
@@ -2711,6 +2724,8 @@ int main(int argc, char *argv[])
             g_noexec = 1;
         if (strcmp(argv[i], "--reconnect-on-stale") == 0)
             g_reconnect_on_stale = 1;
+        if (strcmp(argv[i], "--writeback-cache") == 0)
+            g_writeback_cache = 1;
         if (is_nfsfuse_opt_with_value(argv[i]) && i + 1 < argc)
             i++;
     }
@@ -2758,6 +2773,8 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--noexec") == 0)
             continue;
         if (strcmp(argv[i], "--reconnect-on-stale") == 0)
+            continue;
+        if (strcmp(argv[i], "--writeback-cache") == 0)
             continue;
 
         if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
@@ -2937,12 +2954,13 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    fprintf(stderr, "nfsfuse %s (build %s, %s): %s mounted on %s (nfsv%s%s)\n",
+    fprintf(stderr, "nfsfuse %s (build %s, %s): %s mounted on %s (nfsv%s%s%s)\n",
             NFSFUSE_VERSION, NFSFUSE_BUILD, NFSFUSE_BUILD_DATE,
             g_state.fsname ? g_state.fsname : argv[url_idx],
             argv[mount_idx],
             g_state.safe_v4_mode ? "4" : "3",
-            g_state.max_mode ? ", max" : "");
+            g_state.max_mode ? ", max" : "",
+            g_writeback_cache ? ", writeback" : "");
 
     if (g_debug) {
         DBG(1, "nfsfuse: starting fuse (argc=%d)\n", fuse_argc);
