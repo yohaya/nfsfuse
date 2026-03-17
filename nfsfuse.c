@@ -1206,13 +1206,17 @@ static int sanitize_open_flags(int flags)
 #endif
 
     if (g_state.max_mode && !g_state.safe_v4_mode) {
+        /*
+         * Upgrade O_WRONLY to O_RDWR so the kernel page cache can
+         * read back data for the same file handle (needed for
+         * auto_cache).  Do NOT strip O_APPEND — removing it breaks
+         * atomic append semantics and can cause data corruption when
+         * multiple processes append to the same file.
+         */
         if ((out & O_ACCMODE) == O_WRONLY) {
             out &= ~O_ACCMODE;
             out |= O_RDWR;
         }
-#ifdef O_APPEND
-        out &= ~O_APPEND;
-#endif
     }
 
     return out;
@@ -1784,10 +1788,8 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
 
     fi->fh = (uint64_t)(uintptr_t)h;
 
-    if (g_state.max_mode && !g_state.safe_v4_mode)
-        fi->keep_cache = 1;
-    else
-        fi->keep_cache = 0;
+    fi->keep_cache = 0;
+    fi->direct_io = 0;
 
 #ifdef O_DIRECT
     if (fi->flags & O_DIRECT)
@@ -1834,10 +1836,8 @@ static int nfuse_create(const char *path, mode_t mode, struct fuse_file_info *fi
 
     fi->fh = (uint64_t)(uintptr_t)h;
 
-    if (g_state.max_mode && !g_state.safe_v4_mode)
-        fi->keep_cache = 1;
-    else
-        fi->keep_cache = 0;
+    fi->keep_cache = 0;
+    fi->direct_io = 0;
 
 #ifdef O_DIRECT
     if (fi->flags & O_DIRECT)
@@ -2355,10 +2355,25 @@ static void *nfuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
     }
 
     if (g_state.max_mode) {
-        cfg->kernel_cache = 1;
-        cfg->attr_timeout = 30.0;
-        cfg->entry_timeout = 30.0;
-        cfg->negative_timeout = 5.0;
+        /*
+         * Use auto_cache instead of kernel_cache.  kernel_cache never
+         * invalidates cached data, so reads can return stale data if
+         * the file was modified on the server.  auto_cache checks
+         * file attributes (mtime/size) on each open and invalidates
+         * the page cache when they change — much safer for NFS.
+         *
+         * Do NOT enable WRITEBACK_CACHE: it buffers writes in the
+         * kernel page cache and flushes asynchronously.  If the NFS
+         * server becomes unreachable or the process crashes, buffered
+         * writes are silently lost.  Synchronous writes (the default)
+         * ensure data reaches the NFS server before returning success.
+         */
+        cfg->auto_cache = 1;
+        cfg->ac_attr_timeout_set = 1;
+        cfg->ac_attr_timeout = 3.0;
+        cfg->attr_timeout = 3.0;
+        cfg->entry_timeout = 5.0;
+        cfg->negative_timeout = 3.0;
 
         conn->max_read = g_state.fuse_max_read;
 
@@ -2378,8 +2393,6 @@ static void *nfuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
             conn->want |= FUSE_CAP_ASYNC_READ;
         if (conn->capable & FUSE_CAP_ATOMIC_O_TRUNC)
             conn->want |= FUSE_CAP_ATOMIC_O_TRUNC;
-        if (conn->capable & FUSE_CAP_WRITEBACK_CACHE)
-            conn->want |= FUSE_CAP_WRITEBACK_CACHE;
     } else {
         cfg->auto_cache = 1;
         cfg->ac_attr_timeout_set = 1;
