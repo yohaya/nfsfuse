@@ -479,10 +479,10 @@ static void dead_timeout_on_failure(void)
 
 static void dead_timeout_on_success(void)
 {
-    g_state.last_nfs_success = time(NULL);
-
     if (g_state.dead_timeout <= 0)
         return;
+
+    g_state.last_nfs_success = time(NULL);
 
     if (g_state.first_failure != 0) {
         DBG(1, "nfsfuse: dead-timeout watchdog reset — server responded\n");
@@ -568,9 +568,9 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
     for (;;) {                                                           \
         if (g_state.dead_triggered) { (rc) = -EIO; break; }              \
         pthread_mutex_lock(&g_state.meta_lock);                          \
-        g_state.nfs_call_start = time(NULL);                             \
+        if (g_state.has_dead_timeout) g_state.nfs_call_start = time(NULL); \
         (rc) = (call);                                                   \
-        g_state.nfs_call_start = 0;                                      \
+        if (g_state.has_dead_timeout) g_state.nfs_call_start = 0;        \
         pthread_mutex_unlock(&g_state.meta_lock);                        \
         if ((rc) >= 0) {                                                 \
             dead_timeout_on_success();                                    \
@@ -1328,9 +1328,9 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
 
         for (;;) {
             if (g_state.dead_triggered) { rc = -EIO; break; }
-            g_state.nfs_call_start = time(NULL);
+            if (g_state.has_dead_timeout) g_state.nfs_call_start = time(NULL);
             rc = CALL_NFS_PREAD(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
-            g_state.nfs_call_start = 0;
+            if (g_state.has_dead_timeout) g_state.nfs_call_start = 0;
             if (rc >= 0) {
                 dead_timeout_on_success();
                 break;
@@ -1386,9 +1386,9 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
 
         for (;;) {
             if (g_state.dead_triggered) { rc = -EIO; break; }
-            g_state.nfs_call_start = time(NULL);
+            if (g_state.has_dead_timeout) g_state.nfs_call_start = time(NULL);
             rc = CALL_NFS_PWRITE(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
-            g_state.nfs_call_start = 0;
+            if (g_state.has_dead_timeout) g_state.nfs_call_start = 0;
             if (rc >= 0) {
                 dead_timeout_on_success();
                 break;
