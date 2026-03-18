@@ -593,8 +593,33 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
     }
 
     pthread_mutex_lock(&g_state.meta_lock);
-    /* Do not destroy old context — open file handles still reference it.
-     * Those handles will get NFS errors and the application will reopen. */
+    {
+        /*
+         * Neutralize the old context before swapping.  We can't destroy
+         * it (open file handles reference its internal nfsfh structs),
+         * but we MUST stop it from doing anything:
+         *
+         * 1. Disable autoreconnect — prevents libnfs from trying to
+         *    reconnect the dead TCP connection in the background, which
+         *    would allocate/free internal state and cause use-after-free.
+         *
+         * 2. Shut down the socket — ensures no background I/O, no
+         *    callbacks, no internal state changes.  Any pending poll()
+         *    returns immediately.
+         *
+         * The old context becomes an inert shell: its nfsfh structs
+         * are still valid memory but unusable.  file_handle_ctx()
+         * returns g_state.meta_nfs (the new context), so no code path
+         * will call libnfs functions on the old context.
+         */
+        struct nfs_context *old_ctx = g_state.meta_nfs;
+        if (old_ctx) {
+            int old_fd = nfs_get_fd(old_ctx);
+            nfs_set_autoreconnect(old_ctx, 0);
+            if (old_fd >= 0)
+                shutdown(old_fd, SHUT_RDWR);
+        }
+    }
     g_state.meta_nfs = new_ctx;
     pthread_mutex_unlock(&g_state.meta_lock);
 
