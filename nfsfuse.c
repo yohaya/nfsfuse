@@ -105,6 +105,8 @@ static void dbg_print_timestamp(FILE *fp)
     } \
 } while (0)
 
+static int classify_nfs_error(int rc);  /* forward declaration */
+
 static void log_nfs_error(const char *op, const char *path,
                           int rc, struct nfs_context *ctx)
 {
