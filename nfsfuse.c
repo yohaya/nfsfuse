@@ -450,8 +450,8 @@ static int deferred_close_peek(const char *path, struct nfs_context **out_ctx,
 #define RETRY_RECONNECT  1
 #define RETRY_WAIT       2
 
-#define NFS4_RETRY_MAX       6
-#define NFS4_RETRY_WAIT_SEC  5
+static int g_nfs4_retry_max = 5;
+static int g_nfs4_retry_wait = 30;
 
 /*
  * Dead-server watchdog: track consecutive failures.
@@ -575,10 +575,10 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
  * Resilient metadata operation wrapper.  Handles transient NFS4 errors:
  *
  *   1. On EXPIRED/STALE_CLIENTID: reconnect (remount) and retry.
- *   2. On GRACE/timeout: wait NFS4_RETRY_WAIT_SEC seconds and retry
+ *   2. On GRACE/timeout: wait g_nfs4_retry_wait seconds and retry
  *      without reconnecting — the server is recovering and the current
  *      session will become valid again once the grace period ends.
- *   3. Retry up to NFS4_RETRY_MAX times with increasing wait, so we
+ *   3. Retry up to g_nfs4_retry_max times with increasing wait, so we
  *      can survive a ~30-second grace period.
  *
  * The 'call' expression must use g_state.meta_nfs (updated on reconnect).
@@ -603,7 +603,7 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
         dead_timeout_on_failure();                                       \
         if (g_state.dead_triggered) { (rc) = -EIO; break; }              \
         int _cls = classify_nfs_error(rc);                               \
-        if (_cls == RETRY_NONE || _retries >= NFS4_RETRY_MAX)            \
+        if (_cls == RETRY_NONE || _retries >= g_nfs4_retry_max)            \
             break;                                                       \
         _retries++;                                                      \
         if (_cls == RETRY_RECONNECT && !_did_reconnect) {                \
@@ -614,13 +614,13 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
         } else {                                                         \
             DBG(1, "nfsfuse: %s on %s %s — waiting %ds (retry %d/%d)\n", \
                 reconnect_reason(rc), (op), (path) ? (path) : "",        \
-                NFS4_RETRY_WAIT_SEC, _retries, NFS4_RETRY_MAX);          \
+                g_nfs4_retry_wait, _retries, g_nfs4_retry_max);          \
             if (g_log_errors)                                            \
                 syslog(LOG_WARNING, "%s on %s %s — retry %d/%d",         \
                        reconnect_reason(rc), (op),                       \
                        (path) ? (path) : "",                             \
-                       _retries, NFS4_RETRY_MAX);                        \
-            sleep(NFS4_RETRY_WAIT_SEC);                                  \
+                       _retries, g_nfs4_retry_max);                        \
+            sleep(g_nfs4_retry_wait);                                  \
         }                                                                \
     }                                                                    \
 } while (0)
@@ -1402,7 +1402,7 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
             int _rcls = classify_nfs_error(rc);
             if (_rcls == RETRY_NONE)
                 break;
-            if (io_retries >= NFS4_RETRY_MAX) {
+            if (io_retries >= g_nfs4_retry_max) {
                 if (_rcls == RETRY_RECONNECT) {
                     file_handle_unlock(h);
                     reconnect_meta_context(rc, "read", NULL);
@@ -1417,13 +1417,13 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
             }
             io_retries++;
             DBG(1, "nfsfuse: read transient error — waiting %ds (retry %d/%d)\n",
-                NFS4_RETRY_WAIT_SEC, io_retries, NFS4_RETRY_MAX);
+                g_nfs4_retry_wait, io_retries, g_nfs4_retry_max);
             if (g_log_errors)
                 syslog(LOG_WARNING, "read error — retry %d/%d (%s)",
-                       io_retries, NFS4_RETRY_MAX,
+                       io_retries, g_nfs4_retry_max,
                        reconnect_reason(rc));
             file_handle_unlock(h);
-            sleep(NFS4_RETRY_WAIT_SEC);
+            sleep(g_nfs4_retry_wait);
             file_handle_lock(h);
         }
 
@@ -1480,7 +1480,7 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
             int _wcls = classify_nfs_error(rc);
             if (_wcls == RETRY_NONE)
                 break;
-            if (io_retries >= NFS4_RETRY_MAX) {
+            if (io_retries >= g_nfs4_retry_max) {
                 if (_wcls == RETRY_RECONNECT) {
                     file_handle_unlock(h);
                     reconnect_meta_context(rc, "write", NULL);
@@ -1495,13 +1495,13 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
             }
             io_retries++;
             DBG(1, "nfsfuse: write transient error — waiting %ds (retry %d/%d)\n",
-                NFS4_RETRY_WAIT_SEC, io_retries, NFS4_RETRY_MAX);
+                g_nfs4_retry_wait, io_retries, g_nfs4_retry_max);
             if (g_log_errors)
                 syslog(LOG_WARNING, "write error — retry %d/%d (%s)",
-                       io_retries, NFS4_RETRY_MAX,
+                       io_retries, g_nfs4_retry_max,
                        reconnect_reason(rc));
             file_handle_unlock(h);
-            sleep(NFS4_RETRY_WAIT_SEC);
+            sleep(g_nfs4_retry_wait);
             file_handle_lock(h);
         }
 
@@ -1823,7 +1823,7 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
             if (rc >= 0)
                 break;
             int cls = classify_nfs_error(rc);
-            if (cls == RETRY_NONE || retries >= NFS4_RETRY_MAX)
+            if (cls == RETRY_NONE || retries >= g_nfs4_retry_max)
                 break;
             retries++;
             if (cls == RETRY_RECONNECT && !did_reconnect) {
@@ -1833,8 +1833,8 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
                     break;
             } else {
                 DBG(1, "nfsfuse: open %s — waiting %ds (retry %d/%d)\n",
-                    path ? path : "", NFS4_RETRY_WAIT_SEC, retries, NFS4_RETRY_MAX);
-                sleep(NFS4_RETRY_WAIT_SEC);
+                    path ? path : "", g_nfs4_retry_wait, retries, g_nfs4_retry_max);
+                sleep(g_nfs4_retry_wait);
             }
         }
     }
@@ -1911,7 +1911,7 @@ static int nfuse_create(const char *path, mode_t mode, struct fuse_file_info *fi
             if (rc >= 0)
                 break;
             int cls = classify_nfs_error(rc);
-            if (cls == RETRY_NONE || retries >= NFS4_RETRY_MAX)
+            if (cls == RETRY_NONE || retries >= g_nfs4_retry_max)
                 break;
             retries++;
             if (cls == RETRY_RECONNECT && !did_reconnect) {
@@ -1921,8 +1921,8 @@ static int nfuse_create(const char *path, mode_t mode, struct fuse_file_info *fi
                     break;
             } else {
                 DBG(1, "nfsfuse: create %s — waiting %ds (retry %d/%d)\n",
-                    path ? path : "", NFS4_RETRY_WAIT_SEC, retries, NFS4_RETRY_MAX);
-                sleep(NFS4_RETRY_WAIT_SEC);
+                    path ? path : "", g_nfs4_retry_wait, retries, g_nfs4_retry_max);
+                sleep(g_nfs4_retry_wait);
             }
         }
     }
@@ -2608,7 +2608,9 @@ static void usage(const char *prog)
         "  --autoreconnect <n>  TCP reconnect attempts on disconnect (-1=infinite, default: 0)\n"
         "  --tcp-syncnt <n>     TCP SYN retry count for connection establishment\n"
         "  --poll-timeout <ms>  Poll interval in milliseconds between response checks\n"
-        "  --dead-timeout <s>   Unmount after N seconds of consecutive failures (default: disabled)\n\n"
+        "  --dead-timeout <s>   Unmount after N seconds of consecutive failures (default: disabled)\n"
+        "  --nfs4-retries <n>   NFS4 error retry attempts (default: 5)\n"
+        "  --nfs4-retry-wait <s> Seconds between NFS4 retries (default: 30)\n\n"
         "Examples:\n"
         "  %s 'nfs://192.168.52.200/store001/cdimage?version=3' /mnt/nfs\n"
         "  %s --timeout 30000 --autoreconnect -1 'nfs://10.0.0.1/data' /mnt/nfs\n"
@@ -2694,7 +2696,9 @@ static int is_nfsfuse_opt(const char *arg)
            strcmp(arg, "--autoreconnect") == 0 ||
            strcmp(arg, "--tcp-syncnt") == 0 ||
            strcmp(arg, "--poll-timeout") == 0 ||
-           strcmp(arg, "--dead-timeout") == 0;
+           strcmp(arg, "--dead-timeout") == 0 ||
+           strcmp(arg, "--nfs4-retries") == 0 ||
+           strcmp(arg, "--nfs4-retry-wait") == 0;
 }
 
 static int is_nfsfuse_opt_with_value(const char *arg)
@@ -2705,6 +2709,8 @@ static int is_nfsfuse_opt_with_value(const char *arg)
            strcmp(arg, "--tcp-syncnt") == 0 ||
            strcmp(arg, "--poll-timeout") == 0 ||
            strcmp(arg, "--dead-timeout") == 0 ||
+           strcmp(arg, "--nfs4-retries") == 0 ||
+           strcmp(arg, "--nfs4-retry-wait") == 0 ||
            strcmp(arg, "--debug-output") == 0;
 }
 
@@ -2865,6 +2871,14 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--dead-timeout") == 0 && i + 1 < argc) {
             g_state.dead_timeout = atoi(argv[++i]);
             g_state.has_dead_timeout = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--nfs4-retries") == 0 && i + 1 < argc) {
+            g_nfs4_retry_max = atoi(argv[++i]);
+            continue;
+        }
+        if (strcmp(argv[i], "--nfs4-retry-wait") == 0 && i + 1 < argc) {
+            g_nfs4_retry_wait = atoi(argv[++i]);
             continue;
         }
 
