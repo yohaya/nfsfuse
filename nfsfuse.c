@@ -82,6 +82,9 @@ static int g_reconnect_on_stale = 1;     /* on by default */
 static int g_reconnect_on_io_error = 1;  /* on by default */
 static int g_writeback_cache = 0;
 static int g_async_mode = 0;     /* 1 = use async libnfs API with event loop */
+static int g_auto_remount = 0;   /* 1 = re-exec on dead-timeout instead of exit */
+static int g_saved_argc = 0;
+static char **g_saved_argv = NULL;
 static FILE *g_debug_file = NULL;  /* non-NULL = write debug to file */
 static int g_debug_syslog = 0;    /* 1 = write debug to syslog */
 
@@ -1619,6 +1622,19 @@ static void *dead_timeout_watchdog_func(void *arg)
         }
     }
 
+    if (g_auto_remount && g_saved_argv) {
+        DBG(1, "nfsfuse: dead-watchdog: auto-remount — re-execing\n");
+        if (g_log_errors)
+            syslog(LOG_CRIT, "dead-timeout: auto-remount — restarting");
+        /* Re-exec ourselves with the same arguments.
+         * execv replaces the process image, so the stale FUSE mount
+         * is cleaned up by the kernel, and a fresh mount is created. */
+        execv(g_saved_argv[0], g_saved_argv);
+        /* execv only returns on error */
+        DBG(1, "nfsfuse: dead-watchdog: execv failed: %s\n",
+            strerror(errno));
+    }
+
     DBG(1, "nfsfuse: dead-watchdog: force exit (safety net)\n");
     if (g_log_errors)
         syslog(LOG_CRIT, "dead-timeout: force-exiting");
@@ -3097,6 +3113,7 @@ static void usage(const char *prog)
         "  --do-not-reconnect-on-stale    Disable auto-reconnect on ESTALE (on by default)\n"
         "  --do-not-reconnect-on-io-error Disable auto-reconnect on EIO (on by default)\n"
         "  --async              Use async NFS event loop (prevents stuck-call freezes)\n"
+        "  --auto-remount       Re-exec on dead-timeout instead of just dying\n"
         "  --writeback-cache    Enable kernel writeback cache (faster writes,\n"
         "                       risk of data loss on crash — see docs)\n"
         "  --version            Show version information\n\n"
@@ -3194,6 +3211,7 @@ static int is_nfsfuse_opt(const char *arg)
            strcmp(arg, "--do-not-reconnect-on-io-error") == 0 ||
            strcmp(arg, "--writeback-cache") == 0 ||
            strcmp(arg, "--async") == 0 ||
+           strcmp(arg, "--auto-remount") == 0 ||
            strcmp(arg, "--timeout") == 0 ||
            strcmp(arg, "--retrans") == 0 ||
            strcmp(arg, "--autoreconnect") == 0 ||
@@ -3254,6 +3272,10 @@ int main(int argc, char *argv[])
     int i;
     int url_idx = -1;
     int mount_idx = -1;
+
+    /* Save for --auto-remount (re-exec on dead-timeout) */
+    g_saved_argc = argc;
+    g_saved_argv = argv;
     int fuse_argc = 0;
     char **fuse_argv = NULL;
     int rc = 1;
@@ -3307,6 +3329,8 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--writeback-cache") == 0)
         if (strcmp(argv[i], "--async") == 0)
             g_async_mode = 1;
+        if (strcmp(argv[i], "--auto-remount") == 0)
+            g_auto_remount = 1;
             g_writeback_cache = 1;
         if (is_nfsfuse_opt_with_value(argv[i]) && i + 1 < argc)
             i++;
@@ -3333,7 +3357,11 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--max") == 0) {
             g_state.max_mode = 1;
             continue;
+        if (strcmp(argv[i], "--auto-remount") == 0)
+            continue;
         if (strcmp(argv[i], "--async") == 0)
+            continue;
+        if (strcmp(argv[i], "--auto-remount") == 0)
             continue;
         }
         if (strcmp(argv[i], "--debug") == 0) {
@@ -3364,8 +3392,14 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--writeback-cache") == 0)
         if (strcmp(argv[i], "--async") == 0)
             g_async_mode = 1;
+        if (strcmp(argv[i], "--auto-remount") == 0)
+            g_auto_remount = 1;
+            continue;
+        if (strcmp(argv[i], "--auto-remount") == 0)
             continue;
         if (strcmp(argv[i], "--async") == 0)
+            continue;
+        if (strcmp(argv[i], "--auto-remount") == 0)
             continue;
 
         if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
