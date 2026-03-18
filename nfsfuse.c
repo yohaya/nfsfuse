@@ -105,13 +105,10 @@ static void dbg_print_timestamp(FILE *fp)
     } \
 } while (0)
 
-static int classify_nfs_error(int rc);  /* forward declaration */
-
 static void log_nfs_error(const char *op, const char *path,
                           int rc, struct nfs_context *ctx)
 {
     const char *nfs_msg;
-    int priority;
 
     nfs_msg = ctx ? nfs_get_error(ctx) : NULL;
     if (nfs_msg == NULL || nfs_msg[0] == '\0')
@@ -130,7 +127,7 @@ static void log_nfs_error(const char *op, const char *path,
      * pread_full, pwrite_full) with retry counts and recovery status.
      * Don't duplicate them here — only log non-retriable errors.
      */
-    if (classify_nfs_error(rc) != RETRY_NONE) {
+    if (rc == -ERANGE || rc == -ETIMEDOUT || rc == -ESTALE) {
         DBG(1, "nfsfuse: %s %s: %s (rc=%d/%s) [will retry]\n",
             op, path ? path : "", nfs_msg, rc, strerror(-rc));
         return;
@@ -139,9 +136,7 @@ static void log_nfs_error(const char *op, const char *path,
     if (!g_log_errors)
         return;
 
-    priority = LOG_ERR;
-
-    syslog(priority, "%s %s: %s (rc=%d/%s)",
+    syslog(LOG_ERR, "%s %s: %s (rc=%d/%s)",
            op, path ? path : "",
            nfs_msg, rc, strerror(-rc));
 }
@@ -282,10 +277,8 @@ static int nfs_err(int rc)
 static int nfs_err_log(int rc, const char *op, const char *path,
                        struct nfs_context *ctx)
 {
-    int err = nfs_err(rc);
-
-    log_nfs_error(op, path, err, ctx);
-    return err;
+    log_nfs_error(op, path, rc, ctx);
+    return nfs_err(rc);
 }
 
 static struct nfs_context *mount_new_context(const char *url);
@@ -1312,7 +1305,7 @@ static int open_file_handle_common(const char *path, int flags, mode_t mode,
     }
 
     if (rc < 0) {
-        log_nfs_error("open", path, nfs_err(rc), ctx);
+        log_nfs_error("open", path, rc, ctx);
         if (use_private_ctx)
             destroy_nfs_context_safe(ctx);
         return nfs_err(rc);
@@ -1432,7 +1425,7 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
 
         if (rc < 0) {
             if (done == 0) {
-                log_nfs_error("read", NULL, nfs_err(rc), file_handle_ctx(h));
+                log_nfs_error("read", NULL, rc, file_handle_ctx(h));
                 file_handle_unlock(h);
                 return nfs_err(rc);
             }
@@ -1510,7 +1503,7 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
 
         if (rc < 0) {
             if (done == 0) {
-                log_nfs_error("write", NULL, nfs_err(rc), file_handle_ctx(h));
+                log_nfs_error("write", NULL, rc, file_handle_ctx(h));
                 file_handle_unlock(h);
                 return nfs_err(rc);
             }
@@ -1678,7 +1671,7 @@ static int nfuse_opendir(const char *path, struct fuse_file_info *fi)
 
         rc = nfs_opendir(ctx, path, &dir);
         if (rc < 0) {
-            log_nfs_error("opendir", path, nfs_err(rc), ctx);
+            log_nfs_error("opendir", path, rc, ctx);
             destroy_nfs_context_safe(ctx);
             free(h);
             return nfs_err(rc);
