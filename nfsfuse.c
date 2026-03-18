@@ -502,7 +502,8 @@ static int async_nfs_pread(struct nfs_context *ctx, struct nfsfh *fh,
     int rc;
 
     pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_pread_async(ctx, fh, offset, count, async_generic_cb, &ar);
+    rc = nfs_pread_async(ctx, fh, (void *)buf, (size_t)count,
+                         (uint64_t)offset, async_generic_cb, &ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
         return rc;
@@ -515,10 +516,7 @@ static int async_nfs_pread(struct nfs_context *ctx, struct nfsfh *fh,
         return rc;
     if (ar.err < 0)
         return ar.err;
-    /* ar.err = bytes read, ar.data = buffer */
-    if (ar.data && ar.err > 0)
-        memcpy(buf, ar.data, (size_t)ar.err);
-    return ar.err;
+    return ar.err;  /* bytes read; data written directly to buf */
 }
 
 static int async_nfs_pwrite(struct nfs_context *ctx, struct nfsfh *fh,
@@ -528,8 +526,8 @@ static int async_nfs_pwrite(struct nfs_context *ctx, struct nfsfh *fh,
     int rc;
 
     pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_pwrite_async(ctx, fh, offset, count, buf,
-                          async_generic_cb, &ar);
+    rc = nfs_pwrite_async(ctx, fh, (const void *)buf, (size_t)count,
+                          (uint64_t)offset, async_generic_cb, &ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
         return rc;
