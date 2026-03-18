@@ -184,6 +184,10 @@ struct app_state {
     time_t first_failure;    /* monotonic time of first consecutive failure, 0 = healthy */
     int dead_triggered;      /* 1 = already triggered unmount */
 
+    /* Stuck-call recovery: shut down socket after N seconds of meta_lock busy */
+    int stuck_timeout;       /* 0 = disabled */
+    volatile time_t meta_lock_busy_since;  /* when trylock first failed, 0 = not busy */
+
     /*
      * Lock-free timestamps for the dedicated watchdog thread.
      * volatile ensures visibility across threads without a mutex.
@@ -984,7 +988,8 @@ static void *keepalive_thread_func(void *arg)
          * When dead-timeout failure tracking is active: ~5 seconds
          * (10 * 0.5s) so the watchdog can advance the counter faster.
          */
-        int cycles = (g_state.has_dead_timeout && g_state.first_failure != 0)
+        int cycles = (g_state.meta_lock_busy_since != 0 ||
+                      (g_state.has_dead_timeout && g_state.first_failure != 0))
                      ? 10 : 60;
         int i;
         for (i = 0; i < cycles && g_state.keepalive_running; i++)
@@ -1018,6 +1023,7 @@ static void *keepalive_thread_func(void *arg)
          * will be called.
          */
         if (pthread_mutex_trylock(&g_state.meta_lock) == 0) {
+            g_state.meta_lock_busy_since = 0;  /* lock is free, reset */
             if (g_state.meta_nfs) {
                 DBG(3, "nfsfuse: watchdog: calling nfs_lstat64...\n");
                 int ka_rc = nfs_lstat64(g_state.meta_nfs, "/", &st);
@@ -1035,6 +1041,40 @@ static void *keepalive_thread_func(void *arg)
             DBG(3, "nfsfuse: watchdog: meta_lock busy, "
                    "NFS call likely stuck — treating as failure\n");
             dead_timeout_on_failure();
+
+            /*
+             * Stuck-call recovery: if meta_lock has been held for
+             * stuck_timeout seconds, shut down the NFS socket to
+             * unblock the stuck call.  The call returns error,
+             * releases meta_lock, and the retry logic reconnects.
+             * The mount stays alive — no _exit(), no fuse_exit().
+             */
+            if (g_state.stuck_timeout > 0) {
+                time_t now = time(NULL);
+                if (g_state.meta_lock_busy_since == 0)
+                    g_state.meta_lock_busy_since = now;
+
+                long stuck_secs = (long)(now - g_state.meta_lock_busy_since);
+                DBG(3, "nfsfuse: watchdog: meta_lock busy for %lds "
+                       "(stuck_timeout=%ds)\n",
+                    stuck_secs, g_state.stuck_timeout);
+
+                if (stuck_secs >= g_state.stuck_timeout && g_state.meta_nfs) {
+                    int nfs_fd = nfs_get_fd(g_state.meta_nfs);
+                    if (nfs_fd >= 0) {
+                        DBG(1, "nfsfuse: stuck-call recovery: shutting down "
+                               "NFS socket (fd=%d) after %lds\n",
+                            nfs_fd, stuck_secs);
+                        if (g_log_errors)
+                            syslog(LOG_WARNING,
+                                   "stuck NFS call for %ld seconds "
+                                   "— shutting down socket to recover",
+                                   stuck_secs);
+                        shutdown(nfs_fd, SHUT_RDWR);
+                    }
+                    g_state.meta_lock_busy_since = 0;
+                }
+            }
         }
 
         if (g_state.dead_triggered)
@@ -2669,7 +2709,8 @@ static void usage(const char *prog)
         "  --autoreconnect <n>  TCP reconnect attempts on disconnect (-1=infinite, default: 0)\n"
         "  --tcp-syncnt <n>     TCP SYN retry count for connection establishment\n"
         "  --poll-timeout <ms>  Poll interval in milliseconds between response checks\n"
-        "  --dead-timeout <s>   Unmount after N seconds of consecutive failures (default: disabled)\n"
+        "  --dead-timeout <s>   Unmount after N seconds of consecutive failures (default: disabled)
+        "  --stuck-timeout <s>  Recover stuck NFS calls by shutting down socket (default: disabled)\n"
         "  --nfs4-retries <n>   NFS4 error retry attempts (default: 5)\n"
         "  --nfs4-retry-wait <s> Seconds between NFS4 retries (default: 30)\n\n"
         "Examples:\n"
@@ -2761,6 +2802,7 @@ static int is_nfsfuse_opt(const char *arg)
            strcmp(arg, "--tcp-syncnt") == 0 ||
            strcmp(arg, "--poll-timeout") == 0 ||
            strcmp(arg, "--dead-timeout") == 0 ||
+           strcmp(arg, "--stuck-timeout") == 0 ||
            strcmp(arg, "--nfs4-retries") == 0 ||
            strcmp(arg, "--nfs4-retry-wait") == 0;
 }
@@ -2773,6 +2815,7 @@ static int is_nfsfuse_opt_with_value(const char *arg)
            strcmp(arg, "--tcp-syncnt") == 0 ||
            strcmp(arg, "--poll-timeout") == 0 ||
            strcmp(arg, "--dead-timeout") == 0 ||
+           strcmp(arg, "--stuck-timeout") == 0 ||
            strcmp(arg, "--nfs4-retries") == 0 ||
            strcmp(arg, "--nfs4-retry-wait") == 0 ||
            strcmp(arg, "--debug-output") == 0;
@@ -2947,6 +2990,10 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--dead-timeout") == 0 && i + 1 < argc) {
             g_state.dead_timeout = atoi(argv[++i]);
             g_state.has_dead_timeout = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--stuck-timeout") == 0 && i + 1 < argc) {
+            g_state.stuck_timeout = atoi(argv[++i]);
             continue;
         }
         if (strcmp(argv[i], "--nfs4-retries") == 0 && i + 1 < argc) {
