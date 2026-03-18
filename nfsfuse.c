@@ -73,6 +73,7 @@ static int g_debug = 0;
 static int g_log_errors = 0;
 static int g_syslog_open = 0;
 static char g_syslog_ident[256];  /* "nfsfuse[mountpoint]" for syslog */
+static const char *g_mountpoint = "";  /* mountpoint path for debug log prefix */
 static int g_noatime = 0;
 static int g_nodiratime = 0;
 static int g_noexec = 0;
@@ -88,10 +89,16 @@ static void dbg_print_timestamp(FILE *fp)
     struct tm tm;
     gettimeofday(&tv, NULL);
     localtime_r(&tv.tv_sec, &tm);
-    fprintf(fp, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
-            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-            tm.tm_hour, tm.tm_min, tm.tm_sec,
-            (int)(tv.tv_usec / 1000));
+    if (g_mountpoint[0])
+        fprintf(fp, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] [%s] ",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                tm.tm_hour, tm.tm_min, tm.tm_sec,
+                (int)(tv.tv_usec / 1000), g_mountpoint);
+    else
+        fprintf(fp, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                tm.tm_hour, tm.tm_min, tm.tm_sec,
+                (int)(tv.tv_usec / 1000));
 }
 
 #define DBG(lvl, ...) do { \
@@ -1023,7 +1030,16 @@ static void *keepalive_thread_func(void *arg)
          * will be called.
          */
         if (pthread_mutex_trylock(&g_state.meta_lock) == 0) {
-            g_state.meta_lock_busy_since = 0;  /* lock is free, reset */
+            if (g_state.meta_lock_busy_since != 0) {
+                /* Lock was busy, now free — stuck-call recovery worked */
+                DBG(1, "nfsfuse: stuck-call recovery: meta_lock released, "
+                       "mount recovered\n");
+                if (g_log_errors)
+                    syslog(LOG_NOTICE,
+                           "stuck-call recovery: NFS call unblocked, "
+                           "mount recovered");
+            }
+            g_state.meta_lock_busy_since = 0;
             if (g_state.meta_nfs) {
                 DBG(3, "nfsfuse: watchdog: calling nfs_lstat64...\n");
                 int ka_rc = nfs_lstat64(g_state.meta_nfs, "/", &st);
@@ -1038,7 +1054,7 @@ static void *keepalive_thread_func(void *arg)
             pthread_mutex_unlock(&g_state.meta_lock);
         } else {
             /* Lock held — another thread is stuck in an NFS call */
-            DBG(3, "nfsfuse: watchdog: meta_lock busy, "
+            DBG(1, "nfsfuse: watchdog: meta_lock busy, "
                    "NFS call likely stuck — treating as failure\n");
             dead_timeout_on_failure();
 
@@ -3022,12 +3038,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* Open syslog with mountpoint in the ident so each mount's messages
-     * are distinguishable: "nfsfuse[/storage/us-at-cdimage][1234]: ..." */
+    /* Store mountpoint for debug log prefix and syslog ident */
+    g_mountpoint = argv[mount_idx];
+
     if (g_log_errors || g_debug_syslog) {
-        const char *mp = argv[mount_idx];
         snprintf(g_syslog_ident, sizeof(g_syslog_ident),
-                 "nfsfuse[%s]", mp);
+                 "nfsfuse[%s]", g_mountpoint);
         openlog(g_syslog_ident, LOG_PID, LOG_DAEMON);
         g_syslog_open = 1;
     }
