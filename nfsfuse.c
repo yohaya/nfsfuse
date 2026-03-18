@@ -77,6 +77,7 @@ static int g_noatime = 0;
 static int g_nodiratime = 0;
 static int g_noexec = 0;
 static int g_reconnect_on_stale = 0;
+static int g_reconnect_on_io_error = 0;
 static int g_writeback_cache = 0;
 static FILE *g_debug_file = NULL;  /* non-NULL = write debug to file */
 static int g_debug_syslog = 0;    /* 1 = write debug to syslog */
@@ -127,7 +128,8 @@ static void log_nfs_error(const char *op, const char *path,
      * pread_full, pwrite_full) with retry counts and recovery status.
      * Don't duplicate them here — only log non-retriable errors.
      */
-    if (rc == -ERANGE || rc == -ETIMEDOUT || rc == -ESTALE || rc == -EINVAL) {
+    if (rc == -ERANGE || rc == -ETIMEDOUT || rc == -ESTALE || rc == -EINVAL ||
+        (g_reconnect_on_io_error && rc == -EIO)) {
         DBG(1, "nfsfuse: %s %s: %s (rc=%d/%s) [will retry]\n",
             op, path ? path : "", nfs_msg, rc, strerror(-rc));
         return;
@@ -520,6 +522,8 @@ static int classify_nfs_error(int rc)
         return RETRY_WAIT;
     if (g_reconnect_on_stale && rc == -ESTALE)
         return RETRY_RECONNECT;
+    if (g_reconnect_on_io_error && rc == -EIO)
+        return RETRY_RECONNECT;
     return RETRY_NONE;
 }
 
@@ -529,6 +533,8 @@ static const char *reconnect_reason(int rc)
         return "NFS4ERR_EXPIRED/GRACE";
     if (rc == -EINVAL)
         return "NFS4ERR_BADHANDLE";
+    if (rc == -EIO)
+        return "I/O error";
     if (rc == -ESTALE)
         return "ESTALE";
     if (rc == -ETIMEDOUT)
@@ -2599,6 +2605,7 @@ static void usage(const char *prog)
         "  --nodiratime         Do not update directory access time\n"
         "  --noexec             Disallow execution of binaries on mount\n"
         "  --reconnect-on-stale Auto-reconnect on stale file handle (ESTALE)\n"
+        "  --reconnect-on-io-error Auto-reconnect on I/O error (EIO)\n"
         "  --writeback-cache    Enable kernel writeback cache (faster writes,\n"
         "                       risk of data loss on crash — see docs)\n"
         "  --version            Show version information\n\n"
@@ -2690,6 +2697,7 @@ static int is_nfsfuse_opt(const char *arg)
            strcmp(arg, "--nodiratime") == 0 ||
            strcmp(arg, "--noexec") == 0 ||
            strcmp(arg, "--reconnect-on-stale") == 0 ||
+           strcmp(arg, "--reconnect-on-io-error") == 0 ||
            strcmp(arg, "--writeback-cache") == 0 ||
            strcmp(arg, "--timeout") == 0 ||
            strcmp(arg, "--retrans") == 0 ||
@@ -2793,6 +2801,8 @@ int main(int argc, char *argv[])
             g_noexec = 1;
         if (strcmp(argv[i], "--reconnect-on-stale") == 0)
             g_reconnect_on_stale = 1;
+        if (strcmp(argv[i], "--reconnect-on-io-error") == 0)
+            g_reconnect_on_io_error = 1;
         if (strcmp(argv[i], "--writeback-cache") == 0)
             g_writeback_cache = 1;
         if (is_nfsfuse_opt_with_value(argv[i]) && i + 1 < argc)
@@ -2839,6 +2849,8 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--noexec") == 0)
             continue;
         if (strcmp(argv[i], "--reconnect-on-stale") == 0)
+            continue;
+        if (strcmp(argv[i], "--reconnect-on-io-error") == 0)
             continue;
         if (strcmp(argv[i], "--writeback-cache") == 0)
             continue;
