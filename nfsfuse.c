@@ -127,7 +127,7 @@ static void log_nfs_error(const char *op, const char *path,
      * pread_full, pwrite_full) with retry counts and recovery status.
      * Don't duplicate them here — only log non-retriable errors.
      */
-    if (rc == -ERANGE || rc == -ETIMEDOUT || rc == -ESTALE) {
+    if (rc == -ERANGE || rc == -ETIMEDOUT || rc == -ESTALE || rc == -EINVAL) {
         DBG(1, "nfsfuse: %s %s: %s (rc=%d/%s) [will retry]\n",
             op, path ? path : "", nfs_msg, rc, strerror(-rc));
         return;
@@ -514,6 +514,8 @@ static int classify_nfs_error(int rc)
 {
     if (g_state.safe_v4_mode && rc == -ERANGE)
         return RETRY_RECONNECT;
+    if (g_state.safe_v4_mode && rc == -EINVAL)
+        return RETRY_RECONNECT;  /* NFS4ERR_BADHANDLE after reconnect */
     if (rc == -ETIMEDOUT)
         return RETRY_WAIT;
     if (g_reconnect_on_stale && rc == -ESTALE)
@@ -525,6 +527,8 @@ static const char *reconnect_reason(int rc)
 {
     if (rc == -ERANGE)
         return "NFS4ERR_EXPIRED/GRACE";
+    if (rc == -EINVAL)
+        return "NFS4ERR_BADHANDLE";
     if (rc == -ESTALE)
         return "ESTALE";
     if (rc == -ETIMEDOUT)
