@@ -584,6 +584,9 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
         pthread_mutex_unlock(&g_state.meta_lock);                        \
         if ((rc) >= 0) {                                                 \
             dead_timeout_on_success();                                    \
+            if (_retries > 0 && g_log_errors)                            \
+                syslog(LOG_NOTICE, "%s %s recovered after %d retries",   \
+                       (op), (path) ? (path) : "", _retries);            \
             break;                                                       \
         }                                                                \
         dead_timeout_on_failure();                                       \
@@ -601,10 +604,11 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
             DBG(1, "nfsfuse: %s on %s %s — waiting %ds (retry %d/%d)\n", \
                 reconnect_reason(rc), (op), (path) ? (path) : "",        \
                 NFS4_RETRY_WAIT_SEC, _retries, NFS4_RETRY_MAX);          \
-            if (g_log_errors && _retries == 1)                           \
-                syslog(LOG_WARNING, "%s on %s %s — waiting for server",  \
+            if (g_log_errors)                                            \
+                syslog(LOG_WARNING, "%s on %s %s — retry %d/%d",         \
                        reconnect_reason(rc), (op),                       \
-                       (path) ? (path) : "");                            \
+                       (path) ? (path) : "",                             \
+                       _retries, NFS4_RETRY_MAX);                        \
             sleep(NFS4_RETRY_WAIT_SEC);                                  \
         }                                                                \
     }                                                                    \
@@ -1377,6 +1381,9 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
             if (g_state.has_dead_timeout) g_state.nfs_call_start = 0;
             if (rc >= 0) {
                 dead_timeout_on_success();
+                if (io_retries > 0 && g_log_errors)
+                    syslog(LOG_NOTICE,
+                           "read recovered after %d retries", io_retries);
                 break;
             }
             dead_timeout_on_failure();
@@ -1385,20 +1392,25 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
             if (_rcls == RETRY_NONE)
                 break;
             if (io_retries >= NFS4_RETRY_MAX) {
-                /* Retries exhausted.  If this was RETRY_RECONNECT
-                 * (NFS4ERR_EXPIRED/GRACE), reconnect so subsequent
-                 * metadata/reopens work on a fresh session. */
                 if (_rcls == RETRY_RECONNECT) {
                     file_handle_unlock(h);
                     reconnect_meta_context(rc, "read", NULL);
                     file_handle_lock(h);
                     rc = -EIO;
                 }
+                if (g_log_errors)
+                    syslog(LOG_ERR,
+                           "read failed after %d retries (rc=%d/%s)",
+                           io_retries, rc, strerror(-rc));
                 break;
             }
             io_retries++;
             DBG(1, "nfsfuse: read transient error — waiting %ds (retry %d/%d)\n",
                 NFS4_RETRY_WAIT_SEC, io_retries, NFS4_RETRY_MAX);
+            if (g_log_errors)
+                syslog(LOG_WARNING, "read error — retry %d/%d (%s)",
+                       io_retries, NFS4_RETRY_MAX,
+                       reconnect_reason(rc));
             file_handle_unlock(h);
             sleep(NFS4_RETRY_WAIT_SEC);
             file_handle_lock(h);
@@ -1447,6 +1459,9 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
             if (g_state.has_dead_timeout) g_state.nfs_call_start = 0;
             if (rc >= 0) {
                 dead_timeout_on_success();
+                if (io_retries > 0 && g_log_errors)
+                    syslog(LOG_NOTICE,
+                           "write recovered after %d retries", io_retries);
                 break;
             }
             dead_timeout_on_failure();
@@ -1455,20 +1470,25 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
             if (_wcls == RETRY_NONE)
                 break;
             if (io_retries >= NFS4_RETRY_MAX) {
-                /* Retries exhausted.  If this was RETRY_RECONNECT
-                 * (NFS4ERR_EXPIRED/GRACE), reconnect so subsequent
-                 * metadata/reopens work on a fresh session. */
                 if (_wcls == RETRY_RECONNECT) {
                     file_handle_unlock(h);
                     reconnect_meta_context(rc, "write", NULL);
                     file_handle_lock(h);
                     rc = -EIO;
                 }
+                if (g_log_errors)
+                    syslog(LOG_ERR,
+                           "write failed after %d retries (rc=%d/%s)",
+                           io_retries, rc, strerror(-rc));
                 break;
             }
             io_retries++;
             DBG(1, "nfsfuse: write transient error — waiting %ds (retry %d/%d)\n",
                 NFS4_RETRY_WAIT_SEC, io_retries, NFS4_RETRY_MAX);
+            if (g_log_errors)
+                syslog(LOG_WARNING, "write error — retry %d/%d (%s)",
+                       io_retries, NFS4_RETRY_MAX,
+                       reconnect_reason(rc));
             file_handle_unlock(h);
             sleep(NFS4_RETRY_WAIT_SEC);
             file_handle_lock(h);
