@@ -5,10 +5,15 @@ A lightweight, single-binary NFS client that mounts NFS exports as local filesys
 ## Features
 
 - **Single static binary** — no dependencies, runs on Debian 8+ and any modern Linux
-- **NFSv3 and NFSv4** support
-- **Userspace NFS** — uses libnfs instead of the kernel NFS client
-- **Performance mode** (`--max`) — per-file NFS contexts, kernel caching, writeback, large I/O chunks
-- **NFSv4 safe mode** — automatically forces single-threaded operation and disables caching for NFSv4
+- **NFSv3 and NFSv4** support via libnfs (userspace NFS client)
+- **Auto-reconnect** — recovers from ESTALE, EIO, NFS4ERR_EXPIRED, NFS4ERR_GRACE, and NFS4ERR_BADHANDLE automatically (enabled by default)
+- **Dead-server watchdog** (`--dead-timeout`) — detects stuck NFS calls, shuts down the socket, and returns EIO to unblock applications
+- **NFS4 lease keepalive** — background thread renews NFSv4 leases every 30 seconds to prevent session expiry during long I/O
+- **Deferred close pool** — keeps recently closed file handles alive for NFSv4 open-close consistency
+- **Performance mode** (`--max`) — larger I/O chunks, kernel page caching (NFSv3), background requests
+- **Syslog logging** (`--log-errors`) — structured error/retry/recovery logging with mountpoint identification
+- **Configurable retry policy** — tune retry count and wait time for NFS4 transient errors
+- **Debug tracing** — three verbosity levels, output to stderr, file, or syslog
 
 ## Download
 
@@ -19,91 +24,232 @@ git clone https://github.com/yohaya/nfsfuse.git
 chmod +x nfsfuse/bin/nfsfuse
 ```
 
+## Quick start
+
+```bash
+# Simple NFSv4 mount
+nfsfuse 'nfs://192.168.1.100/export/data?version=4' /mnt/nfs
+
+# Production mount with resilience
+nfsfuse --dead-timeout 120 --timeout 15000 --retrans 5 \
+  --autoreconnect 100 --log-errors \
+  --noatime --nodiratime --noexec \
+  'nfs://192.168.1.100/export/data?version=4' /mnt/nfs
+
+# Unmount
+fusermount3 -u /mnt/nfs
+```
+
 ## Usage
 
 ```
-nfsfuse [--max] [--debug] nfs://server/export/path[?version=3|4] <mountpoint> [FUSE options]
+nfsfuse [options] nfs://server/export/path[?version=3|4] <mountpoint> [FUSE options]
 ```
 
-### Options
+### General options
 
 | Option | Description |
-|-----------|----------------------------------------------|
-| `--max` | Enable performance optimizations |
-| `--debug [level]` | Debug tracing to stderr (1=config/reconnect, 2=operations, 3=detailed) |
+|--------|------------|
+| `--max` | Enable performance optimizations (larger I/O, caching for NFSv3) |
+| `--debug [level]` | Debug tracing (1=config/reconnect, 2=all operations, 3=detailed params) |
 | `--debug-output <dst>` | Send debug to file path or `syslog` instead of stderr |
-| `--log-errors` | Log NFS errors to syslog (daemon facility) |
+| `--log-errors` | Log NFS errors and retry lifecycle to syslog (daemon facility) |
 | `--noatime` | Do not update access time on read |
 | `--nodiratime` | Do not update directory access time |
 | `--noexec` | Disallow execution of binaries on mount |
-| `--reconnect-on-stale` | Auto-reconnect on stale file handle (ESTALE) |
-| `--version`| Show version, libnfs version, and build info |
-| `-f` | Run in foreground (FUSE option) |
-| `-d` | Enable FUSE debug output (FUSE option) |
-| `-s` | Force single-threaded mode (FUSE option) |
+| `--writeback-cache` | Enable kernel writeback cache (faster writes, risk of data loss on crash) |
+| `--version` | Show version, libnfs version, and build info |
 
 ### Timeout and retry options
 
-These control how nfsfuse handles slow or unreliable NFS servers:
+| Option | Default | Description |
+|--------|---------|------------|
+| `--timeout <ms>` | 10000 | RPC request timeout in milliseconds |
+| `--retrans <n>` | 0 | RPC retransmission attempts per NFS call |
+| `--autoreconnect <n>` | 0 | TCP reconnect attempts on disconnect (-1=infinite) |
+| `--tcp-syncnt <n>` | (system) | TCP SYN retry count for connection establishment |
+| `--poll-timeout <ms>` | (system) | Poll interval between response checks |
+| `--dead-timeout <s>` | disabled | Kill mount after N seconds of unresponsive NFS server |
+| `--nfs4-retries <n>` | 5 | Retry attempts for NFS4 transient errors (EXPIRED/GRACE/BADHANDLE) |
+| `--nfs4-retry-wait <s>` | 30 | Seconds to wait between NFS4 retries |
+
+### Reconnect options
+
+Auto-reconnect on ESTALE and EIO is **enabled by default**. To disable:
 
 | Option | Description |
-|---|---|
-| `--timeout <ms>` | RPC request timeout in milliseconds (default: 10000). How long to wait for the server to respond to each NFS operation. |
-| `--retrans <n>` | Number of RPC retransmission attempts before a major timeout (default: 0). Each retry uses the `--timeout` value. |
-| `--autoreconnect <n>` | Number of TCP reconnection attempts if the connection drops (default: 0). Set to `-1` for infinite retries. |
-| `--tcp-syncnt <n>` | TCP SYN retry count for initial connection establishment. Controls how many times the TCP handshake is retried. |
-| `--poll-timeout <ms>` | Poll interval in milliseconds between checking for server responses. |
+|--------|------------|
+| `--do-not-reconnect-on-stale` | Disable auto-reconnect on ESTALE |
+| `--do-not-reconnect-on-io-error` | Disable auto-reconnect on EIO |
 
-### Examples
+The legacy flags `--reconnect-on-stale` and `--reconnect-on-io-error` are accepted for backward compatibility (no-op since both are now default).
 
-Mount an NFSv3 export:
+### FUSE options
+
+These are passed directly to libfuse3:
+
+| Option | Description |
+|--------|------------|
+| `-f` | Run in foreground (do not daemonize) |
+| `-d` | Enable FUSE debug output |
+| `-s` | Force single-threaded mode (automatic for NFSv4) |
+
+## Dead-server watchdog (`--dead-timeout`)
+
+The watchdog is a dedicated thread that runs independently of the FUSE event loop and NFS calls. It monitors two volatile timestamps without acquiring any mutexes:
+
+1. **Stuck NFS call detection**: if an NFS call has been in-flight for >= dead-timeout seconds
+2. **No-progress detection**: if no successful NFS operation has completed for >= dead-timeout seconds
+
+When triggered:
+1. Sets `dead_triggered=1` so all new FUSE operations return EIO immediately
+2. Calls `fuse_exit()` to signal the FUSE event loop to stop
+3. Calls `shutdown()` on the NFS TCP socket to unblock the stuck libnfs call
+4. The stuck call returns error, the FUSE I/O path returns **EIO** (not ENOTCONN) to applications
+5. Safety net: `_exit(1)` after 10 seconds if graceful shutdown doesn't complete
+
+Applications (like QEMU) receive EIO which they handle properly, unlike ENOTCONN ("Transport endpoint is not connected") which causes freezes.
+
+### Recommended settings
+
 ```bash
-nfsfuse 'nfs://192.168.1.100/export/data?version=3' /mnt/nfs
+nfsfuse --dead-timeout 120 --timeout 15000 --retrans 5 \
+  --autoreconnect 100 --nfs4-retries 5 --nfs4-retry-wait 30 \
+  --log-errors --noatime --nodiratime --noexec \
+  'nfs://server/export?version=4' /mnt/nfs
 ```
 
-Mount an NFSv4 export:
-```bash
-nfsfuse 'nfs://192.168.1.100/export/data?version=4' /mnt/nfs
+This gives:
+- **75 seconds** max per NFS call (15s timeout x 5 retrans)
+- **120 seconds** dead-timeout watchdog safety net
+- **150 seconds** NFS4 retry window (5 retries x 30s for GRACE/EXPIRED recovery)
+- Auto-reconnect on ESTALE, EIO, NFS4ERR_EXPIRED, NFS4ERR_GRACE, NFS4ERR_BADHANDLE
+
+## NFS4 error handling
+
+libnfs maps multiple NFS4 errors to the same errno values. nfsfuse handles all of them:
+
+| NFS4 Error | libnfs errno | Action |
+|-----------|-------------|--------|
+| NFS4ERR_EXPIRED | ERANGE (-34) | Reconnect NFS session + retry |
+| NFS4ERR_GRACE | ERANGE (-34) | Wait + retry (server recovering) |
+| NFS4ERR_STALE_CLIENTID | ERANGE (-34) | Reconnect + retry |
+| NFS4ERR_BADHANDLE | EINVAL (-22) | Reconnect + retry |
+| ESTALE | ESTALE (-116) | Reconnect + retry (default on) |
+| EIO | EIO (-5) | Reconnect + retry (default on) |
+| ETIMEDOUT | ETIMEDOUT (-110) | Wait + retry |
+
+For metadata operations (getattr, open, mkdir, etc.), the `META_RETRY` macro handles reconnect + retry up to `--nfs4-retries` times. For I/O operations (read, write), the retry loop sleeps `--nfs4-retry-wait` seconds between attempts, then reconnects after retries are exhausted.
+
+ERANGE is mapped to EIO before returning to applications, so callers never see "Numerical result out of range."
+
+## Performance mode (`--max`)
+
+### NFSv3 + `--max`
+
+| Setting | Value |
+|---------|-------|
+| Page cache | `auto_cache` (invalidates on mtime/size change) |
+| Attr timeout | 3 seconds |
+| Entry timeout | 5 seconds |
+| I/O chunk size | Up to 1 MB (capped by server readmax/writemax) |
+| FUSE background requests | 64 |
+| Async read | Enabled |
+| Per-file NFS context | Yes (each file gets its own NFS connection) |
+| FUSE threading | Multi-threaded |
+
+### NFSv4 + `--max`
+
+| Setting | Value |
+|---------|-------|
+| Page cache | Disabled (no kernel caching) |
+| Attr/entry timeout | 0 (every access hits the server) |
+| I/O chunk size | Up to 1 MB |
+| FUSE background requests | 16 |
+| Shared NFS context | Yes (all files share one connection, serialized by meta_lock) |
+| FUSE threading | Single-threaded (forced by `-s`) |
+| NFS4 autoreconnect | Capped to 3 (prevents silent state loss) |
+
+### Without `--max`
+
+Conservative settings: 128KB I/O chunks, `auto_cache` with 1s timeouts (NFSv3), no caching (NFSv4).
+
+### `--writeback-cache`
+
+Opt-in flag that enables `FUSE_CAP_WRITEBACK_CACHE` for both NFSv3 and NFSv4. The kernel buffers writes and flushes asynchronously, providing 2-5x write throughput improvement. **Risk**: unflushed writes are silently lost on crash or server disconnect. Only use for workloads where data loss is acceptable (e.g., backup jobs that can be re-run).
+
+## Syslog logging (`--log-errors`)
+
+Syslog messages include the mountpoint for easy identification when multiple mounts run on the same host:
+
+```
+nfsfuse[/storage/us-at-cdimage][1234]: NFS4ERR_EXPIRED on open /file — reconnecting
+nfsfuse[/storage/us-at-cdimage][1234]: reconnected after NFS4ERR_EXPIRED, retrying open /file
+nfsfuse[/storage/us-at-cdimage][1234]: open /file recovered after 1 retries
 ```
 
-Mount with performance optimizations:
+Retriable errors (ERANGE, ETIMEDOUT, ESTALE, EINVAL, EIO when reconnect-on-io-error is active) are **not** logged individually — only the retry lifecycle (retry N/M, recovered, or failed after N retries) is logged to avoid syslog spam.
+
+Non-retriable errors are logged immediately at `ERR` priority.
+
+## Deferred close pool
+
+NFSv4 uses a deferred close pool (64 slots) that keeps recently closed file handles alive for up to 5 minutes. This prevents the NFS server from reclaiming resources while a file may still be needed (close-to-open consistency).
+
+The pool is **flushed on reconnect** to prevent use-after-free of stale handles from dead sessions. Pool eviction under pressure uses non-blocking trylock to prevent mount freezes during high file turnover.
+
+## NFSv4 notes
+
+- NFSv4 automatically forces single-threaded FUSE (`-s`) because libnfs NFS contexts are not thread-safe
+- All file operations share a single NFS context protected by `meta_lock`
+- Directory caching is disabled for NFSv4 to avoid stale data
+- NFS4 lease keepalive thread sends `getattr("/")` every 30 seconds
+- Autoreconnect is capped to 3 for NFSv4 (prevents silent session state loss)
+
+## Supported FUSE operations
+
+| Operation | Description |
+|-----------|--------------------------|
+| getattr | Stat files and directories |
+| access | Check file access permissions |
+| readlink | Read symbolic link target |
+| opendir / readdir / releasedir | List directory contents |
+| open / create / release | Open, create, close files |
+| mknod | Create device/special files |
+| read / write | Read and write file data |
+| truncate | Truncate files |
+| utimens | Set file timestamps |
+| chmod | Change file permissions |
+| chown | Change file owner/group |
+| unlink | Delete files |
+| mkdir / rmdir | Create and remove directories |
+| rename | Rename files and directories |
+| symlink | Create symbolic links |
+| link | Create hard links |
+| fsync | Flush file data to server |
+| statfs | Filesystem statistics |
+
+## Examples
+
+Mount an NFSv4 export with full resilience:
 ```bash
-nfsfuse --max 'nfs://192.168.1.100/export/data?version=3' /mnt/nfs
+nfsfuse --dead-timeout 120 --timeout 15000 --retrans 5 \
+  --autoreconnect 100 --log-errors \
+  --noatime --nodiratime --noexec \
+  'nfs://192.168.1.100/export/data?version=4' /mnt/nfs
 ```
 
-Mount with 30-second timeout and infinite reconnect (resilient to server restarts):
+Mount an NFSv3 export with performance mode:
 ```bash
-nfsfuse --timeout 30000 --autoreconnect -1 'nfs://10.0.0.1/data' /mnt/nfs
-```
-
-Mount with retries for unreliable networks:
-```bash
-nfsfuse --retrans 5 --tcp-syncnt 3 --timeout 15000 'nfs://10.0.0.1/data' /mnt/nfs
-```
-
-Enable syslog error logging:
-```bash
-nfsfuse --log-errors 'nfs://192.168.1.100/export/data?version=3' /mnt/nfs
-```
-
-Debug mount/config info:
-```bash
-nfsfuse --debug 'nfs://192.168.1.100/export/data?version=4' /mnt/nfs
-```
-
-Trace all FUSE operations:
-```bash
-nfsfuse --debug 2 'nfs://192.168.1.100/export/data?version=4' /mnt/nfs
-```
-
-Full detail (offsets, sizes, flags, modes):
-```bash
-nfsfuse --debug 3 'nfs://192.168.1.100/export/data?version=4' /mnt/nfs
+nfsfuse --max --timeout 15000 --retrans 5 \
+  --autoreconnect -1 --log-errors \
+  'nfs://192.168.1.100/export/data?version=3' /mnt/nfs
 ```
 
 Debug to a file:
 ```bash
-nfsfuse --debug 2 --debug-output /var/log/nfsfuse.log 'nfs://10.0.0.1/data' /mnt/nfs
+nfsfuse --debug 2 --debug-output /var/log/nfsfuse.log \
+  'nfs://10.0.0.1/data?version=4' /mnt/nfs
 ```
 
 Debug to syslog:
@@ -118,43 +264,9 @@ nfsfuse 'nfs://192.168.1.100/export/data' /mnt/nfs -f -d
 
 Unmount:
 ```bash
-fusermount -u /mnt/nfs
-```
-
-## Performance mode (`--max`)
-
-When `--max` is enabled (NFSv3 or NFSv4):
-
-- Each open file/directory gets its own NFS connection for full parallelism
-- Kernel page cache and writeback cache are enabled
-- Attribute and entry caching with 30-second timeouts
-- I/O chunk size auto-tuned up to 1 MB based on server limits
-- Directory readahead buffers enabled (NFSv3)
-
-Without `--max`, a single shared NFS connection is used with conservative caching.
-
-## NFSv4 notes
-
-- NFSv4 automatically forces single-threaded FUSE operation (`-s`) because libnfs NFS contexts are not thread-safe
-- Directory caching is disabled for NFSv4 to avoid stale data
-- When using `--max` with NFSv4, per-file connections are used but kernel caching remains disabled
-
-## Error logging (`--log-errors`)
-
-When `--log-errors` is enabled, all NFS operation failures are logged to syslog under the `daemon` facility with the `nfsfuse` identifier. Each log entry includes:
-
-- The operation that failed (e.g., `read`, `write`, `getattr`, `open`)
-- The file path involved
-- The NFS server error message from libnfs
-- The error code and its human-readable description
-
-Timeout errors are logged at `WARNING` priority; all other errors at `ERR` priority.
-
-View logs with:
-```bash
-grep nfsfuse /var/log/syslog
-# or
-journalctl -t nfsfuse
+fusermount3 -u /mnt/nfs
+# or for a stale mount:
+umount -l /mnt/nfs
 ```
 
 ## Requirements
@@ -184,14 +296,9 @@ env:
   LIBNFS_TAG: libnfs-6.0.2
 ```
 
-To change the libnfs version, update this tag to any release from the [libnfs releases page](https://github.com/sahlberg/libnfs/tags) (e.g. `libnfs-5.0.3`, `libnfs-6.0.1`). Push the change and CI will rebuild with that version.
-
 ### Building locally with system packages
 
-If your distro ships `libnfs-dev` and `libfuse3-dev`:
-
 ```bash
-# Debian/Ubuntu
 apt-get install gcc libfuse3-dev libnfs-dev pkg-config
 
 gcc -O2 -Wall -o nfsfuse nfsfuse.c \
@@ -201,22 +308,15 @@ gcc -O2 -Wall -o nfsfuse nfsfuse.c \
 
 ### Building locally with libnfs from source
 
-To use a specific libnfs version (recommended for best compatibility):
-
 ```bash
-# Install build tools and libfuse3
 apt-get install gcc cmake git pkg-config libfuse3-dev
 
-# Clone and build libnfs (change the tag for a different version)
 LIBNFS_TAG=libnfs-6.0.2
 git clone --depth 1 --branch "$LIBNFS_TAG" https://github.com/sahlberg/libnfs.git /tmp/libnfs
-cd /tmp/libnfs
-mkdir build && cd build
+cd /tmp/libnfs && mkdir build && cd build
 cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
-make -j$(nproc)
-sudo make install
+make -j$(nproc) && sudo make install
 
-# Build nfsfuse
 export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
 gcc -O2 -Wall -o nfsfuse nfsfuse.c \
     -DNFSFUSE_LIBNFS_VERSION="\"$LIBNFS_TAG\"" \
@@ -227,29 +327,22 @@ gcc -O2 -Wall -o nfsfuse nfsfuse.c \
 
 ### Fully static build (portable binary)
 
-To produce a single static binary with no runtime dependencies (like the CI does):
-
 ```bash
-# Requires: gcc, cmake, git, meson, ninja, pkg-config, linux-headers, musl-dev (on Alpine)
-# Or run inside the Alpine Docker container:
 docker run --rm -v "$PWD:/src" -w /src alpine:latest sh -exc '
   apk add --no-cache gcc musl-dev make cmake git meson ninja pkgconf linux-headers
 
   LIBNFS_TAG=libnfs-6.0.2
 
-  # Build libnfs
   git clone --depth 1 --branch "$LIBNFS_TAG" https://github.com/sahlberg/libnfs.git /tmp/libnfs
   cd /tmp/libnfs && mkdir build && cd build
   cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
   make -j$(nproc) && make install
 
-  # Build libfuse3
   git clone --depth 1 https://github.com/libfuse/libfuse.git /tmp/libfuse
   cd /tmp/libfuse && mkdir build && cd build
   meson setup .. --default-library=static --prefix=/usr -Dexamples=false -Dutils=false
   ninja && ninja install
 
-  # Compile nfsfuse
   cd /src
   gcc -O2 -Wall -o nfsfuse nfsfuse.c -static \
       -DNFSFUSE_LIBNFS_VERSION="\"$LIBNFS_TAG\"" \
@@ -261,29 +354,6 @@ docker run --rm -v "$PWD:/src" -w /src alpine:latest sh -exc '
 ```
 
 The resulting binary runs on any Linux with FUSE kernel support (Debian 8+, Ubuntu 14.04+, CentOS 7+, etc.).
-
-## Supported operations
-
-| Operation | Description |
-|-----------|--------------------------|
-| getattr | Stat files and directories |
-| access | Check file access permissions |
-| readlink | Read symbolic link target |
-| opendir / readdir / releasedir | List directory contents |
-| open / create / release | Open, create, close files |
-| mknod | Create device/special files |
-| read / write | Read and write file data |
-| truncate | Truncate files |
-| utimens | Set file timestamps |
-| chmod | Change file permissions |
-| chown | Change file owner/group |
-| unlink | Delete files |
-| mkdir / rmdir | Create and remove directories |
-| rename | Rename files and directories |
-| symlink | Create symbolic links |
-| link | Create hard links |
-| fsync | Flush file data to server |
-| statfs | Filesystem statistics |
 
 ## License
 
