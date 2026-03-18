@@ -76,8 +76,8 @@ static char g_syslog_ident[256];  /* "nfsfuse[mountpoint]" for syslog */
 static int g_noatime = 0;
 static int g_nodiratime = 0;
 static int g_noexec = 0;
-static int g_reconnect_on_stale = 0;
-static int g_reconnect_on_io_error = 0;
+static int g_reconnect_on_stale = 1;     /* on by default */
+static int g_reconnect_on_io_error = 1;  /* on by default */
 static int g_writeback_cache = 0;
 static FILE *g_debug_file = NULL;  /* non-NULL = write debug to file */
 static int g_debug_syslog = 0;    /* 1 = write debug to syslog */
@@ -2604,8 +2604,8 @@ static void usage(const char *prog)
         "  --noatime            Do not update access time on read\n"
         "  --nodiratime         Do not update directory access time\n"
         "  --noexec             Disallow execution of binaries on mount\n"
-        "  --reconnect-on-stale Auto-reconnect on stale file handle (ESTALE)\n"
-        "  --reconnect-on-io-error Auto-reconnect on I/O error (EIO)\n"
+        "  --do-not-reconnect-on-stale    Disable auto-reconnect on ESTALE (on by default)\n"
+        "  --do-not-reconnect-on-io-error Disable auto-reconnect on EIO (on by default)\n"
         "  --writeback-cache    Enable kernel writeback cache (faster writes,\n"
         "                       risk of data loss on crash — see docs)\n"
         "  --version            Show version information\n\n"
@@ -2698,6 +2698,8 @@ static int is_nfsfuse_opt(const char *arg)
            strcmp(arg, "--noexec") == 0 ||
            strcmp(arg, "--reconnect-on-stale") == 0 ||
            strcmp(arg, "--reconnect-on-io-error") == 0 ||
+           strcmp(arg, "--do-not-reconnect-on-stale") == 0 ||
+           strcmp(arg, "--do-not-reconnect-on-io-error") == 0 ||
            strcmp(arg, "--writeback-cache") == 0 ||
            strcmp(arg, "--timeout") == 0 ||
            strcmp(arg, "--retrans") == 0 ||
@@ -2800,9 +2802,13 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--noexec") == 0)
             g_noexec = 1;
         if (strcmp(argv[i], "--reconnect-on-stale") == 0)
-            g_reconnect_on_stale = 1;
+            g_reconnect_on_stale = 1;  /* already default, kept for compat */
         if (strcmp(argv[i], "--reconnect-on-io-error") == 0)
-            g_reconnect_on_io_error = 1;
+            g_reconnect_on_io_error = 1;  /* already default, kept for compat */
+        if (strcmp(argv[i], "--do-not-reconnect-on-stale") == 0)
+            g_reconnect_on_stale = 0;
+        if (strcmp(argv[i], "--do-not-reconnect-on-io-error") == 0)
+            g_reconnect_on_io_error = 0;
         if (strcmp(argv[i], "--writeback-cache") == 0)
             g_writeback_cache = 1;
         if (is_nfsfuse_opt_with_value(argv[i]) && i + 1 < argc)
@@ -2851,6 +2857,10 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--reconnect-on-stale") == 0)
             continue;
         if (strcmp(argv[i], "--reconnect-on-io-error") == 0)
+            continue;
+        if (strcmp(argv[i], "--do-not-reconnect-on-stale") == 0)
+            continue;
+        if (strcmp(argv[i], "--do-not-reconnect-on-io-error") == 0)
             continue;
         if (strcmp(argv[i], "--writeback-cache") == 0)
             continue;
