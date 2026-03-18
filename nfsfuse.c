@@ -31,6 +31,7 @@
 #include <sys/statvfs.h>
 #include <sys/types.h>
 #include <syslog.h>
+#include <poll.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -80,6 +81,7 @@ static int g_noexec = 0;
 static int g_reconnect_on_stale = 1;     /* on by default */
 static int g_reconnect_on_io_error = 1;  /* on by default */
 static int g_writeback_cache = 0;
+static int g_async_mode = 0;     /* 1 = use async libnfs API with event loop */
 static FILE *g_debug_file = NULL;  /* non-NULL = write debug to file */
 static int g_debug_syslog = 0;    /* 1 = write debug to syslog */
 
@@ -295,6 +297,362 @@ static int nfs_err_log(int rc, const char *op, const char *path,
 }
 
 static struct nfs_context *mount_new_context(const char *url);
+
+/*
+ * ======================================================================
+ * Async NFS event loop infrastructure (--async mode)
+ *
+ * Replaces blocking libnfs sync calls with async request + poll loop.
+ * Key advantage: poll() has a short timeout (5s), so meta_lock is
+ * released during the wait and reacquired only briefly for
+ * nfs_service().  A stuck NFS server causes poll() timeouts, not a
+ * permanently held lock.
+ * ======================================================================
+ */
+
+#define ASYNC_POLL_MS  5000  /* 5 second poll timeout */
+
+struct async_result {
+    int done;
+    int err;     /* negative errno on error, or bytes for read/write */
+    void *data;  /* operation-specific result (stat, fh, etc.) */
+};
+
+static void async_generic_cb(int err, struct nfs_context *nfs,
+                              void *data, void *private_data)
+{
+    struct async_result *ar = (struct async_result *)private_data;
+    (void)nfs;
+    ar->err = err;
+    ar->data = data;
+    ar->done = 1;
+}
+
+/*
+ * Run the NFS event loop until the async operation completes, or
+ * stuck_timeout/dead_triggered fires.  meta_lock is released during
+ * poll() so other threads (watchdog, keepalive) are never blocked.
+ *
+ * Returns 0 on success, or negative errno on error/timeout.
+ * The caller must hold meta_lock on entry; it will hold it on return.
+ */
+static int async_event_loop(struct nfs_context *ctx, struct async_result *ar)
+{
+    time_t start = time(NULL);
+    int timeout = g_state.stuck_timeout > 0 ? g_state.stuck_timeout : 120;
+
+    while (!ar->done && !g_state.dead_triggered) {
+        struct pollfd pfd;
+        int r;
+
+        pfd.fd = nfs_get_fd(ctx);
+        pfd.events = nfs_which_events(ctx);
+        pfd.revents = 0;
+
+        if (pfd.fd < 0) {
+            /* Context has no socket — connection lost */
+            return -EIO;
+        }
+
+        /* Release lock during poll so watchdog/keepalive can run */
+        pthread_mutex_unlock(&g_state.meta_lock);
+
+        r = poll(&pfd, 1, ASYNC_POLL_MS);
+
+        pthread_mutex_lock(&g_state.meta_lock);
+
+        if (r > 0) {
+            /* Socket has data/events — process them */
+            if (nfs_service(ctx, pfd.revents) != 0) {
+                DBG(1, "nfsfuse: async: nfs_service error\n");
+                return -EIO;
+            }
+        } else if (r < 0 && errno != EINTR) {
+            DBG(1, "nfsfuse: async: poll error: %s\n", strerror(errno));
+            return -EIO;
+        }
+
+        /* Check timeout */
+        if ((time(NULL) - start) >= timeout) {
+            DBG(1, "nfsfuse: async: operation timed out after %ds\n",
+                timeout);
+            if (g_log_errors)
+                syslog(LOG_WARNING,
+                       "async NFS operation timed out after %d seconds",
+                       timeout);
+            return -ETIMEDOUT;
+        }
+
+        /* Update watchdog timestamp */
+        if (g_state.has_dead_timeout)
+            g_state.nfs_call_start = time(NULL);
+    }
+
+    if (g_state.dead_triggered)
+        return -EIO;
+
+    return 0;  /* ar->err has the NFS result */
+}
+
+/*
+ * Async wrappers for key NFS operations.
+ * Each acquires meta_lock, sends the async request, runs the event
+ * loop, and returns with meta_lock released.
+ */
+
+static int async_nfs_lstat64(struct nfs_context *ctx, const char *path,
+                              struct nfs_stat_64 *st)
+{
+    struct async_result ar = {0};
+    int rc;
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    rc = nfs_lstat64_async(ctx, path, async_generic_cb, &ar);
+    if (rc != 0) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        return rc;
+    }
+
+    rc = async_event_loop(ctx, &ar);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    if (rc != 0)
+        return rc;
+    if (ar.err < 0)
+        return ar.err;
+    if (ar.data && st)
+        memcpy(st, ar.data, sizeof(*st));
+    return 0;
+}
+
+static int async_nfs_open(struct nfs_context *ctx, const char *path,
+                           int flags, struct nfsfh **fh_out)
+{
+    struct async_result ar = {0};
+    int rc;
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    rc = nfs_open_async(ctx, path, flags, async_generic_cb, &ar);
+    if (rc != 0) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        return rc;
+    }
+
+    rc = async_event_loop(ctx, &ar);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    if (rc != 0)
+        return rc;
+    if (ar.err < 0)
+        return ar.err;
+    if (fh_out)
+        *fh_out = (struct nfsfh *)ar.data;
+    return 0;
+}
+
+static int async_nfs_creat(struct nfs_context *ctx, const char *path,
+                            int mode, struct nfsfh **fh_out)
+{
+    struct async_result ar = {0};
+    int rc;
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    rc = nfs_creat_async(ctx, path, mode, async_generic_cb, &ar);
+    if (rc != 0) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        return rc;
+    }
+
+    rc = async_event_loop(ctx, &ar);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    if (rc != 0)
+        return rc;
+    if (ar.err < 0)
+        return ar.err;
+    if (fh_out)
+        *fh_out = (struct nfsfh *)ar.data;
+    return 0;
+}
+
+static int async_nfs_close(struct nfs_context *ctx, struct nfsfh *fh)
+{
+    struct async_result ar = {0};
+    int rc;
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    rc = nfs_close_async(ctx, fh, async_generic_cb, &ar);
+    if (rc != 0) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        return rc;
+    }
+
+    rc = async_event_loop(ctx, &ar);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    if (rc != 0)
+        return rc;
+    return ar.err < 0 ? ar.err : 0;
+}
+
+static int async_nfs_pread(struct nfs_context *ctx, struct nfsfh *fh,
+                            uint64_t offset, size_t count, char *buf)
+{
+    struct async_result ar = {0};
+    int rc;
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    rc = nfs_pread_async(ctx, fh, offset, count, async_generic_cb, &ar);
+    if (rc != 0) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        return rc;
+    }
+
+    rc = async_event_loop(ctx, &ar);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    if (rc != 0)
+        return rc;
+    if (ar.err < 0)
+        return ar.err;
+    /* ar.err = bytes read, ar.data = buffer */
+    if (ar.data && ar.err > 0)
+        memcpy(buf, ar.data, (size_t)ar.err);
+    return ar.err;
+}
+
+static int async_nfs_pwrite(struct nfs_context *ctx, struct nfsfh *fh,
+                             uint64_t offset, size_t count, const char *buf)
+{
+    struct async_result ar = {0};
+    int rc;
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    rc = nfs_pwrite_async(ctx, fh, offset, count, buf,
+                          async_generic_cb, &ar);
+    if (rc != 0) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        return rc;
+    }
+
+    rc = async_event_loop(ctx, &ar);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    if (rc != 0)
+        return rc;
+    return ar.err;  /* bytes written, or negative errno */
+}
+
+static int async_nfs_fsync(struct nfs_context *ctx, struct nfsfh *fh)
+{
+    struct async_result ar = {0};
+    int rc;
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    rc = nfs_fsync_async(ctx, fh, async_generic_cb, &ar);
+    if (rc != 0) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        return rc;
+    }
+
+    rc = async_event_loop(ctx, &ar);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    if (rc != 0)
+        return rc;
+    return ar.err < 0 ? ar.err : 0;
+}
+
+static int async_nfs_fstat64(struct nfs_context *ctx, struct nfsfh *fh,
+                              struct nfs_stat_64 *st)
+{
+    struct async_result ar = {0};
+    int rc;
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    rc = nfs_fstat64_async(ctx, fh, async_generic_cb, &ar);
+    if (rc != 0) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        return rc;
+    }
+
+    rc = async_event_loop(ctx, &ar);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    if (rc != 0)
+        return rc;
+    if (ar.err < 0)
+        return ar.err;
+    if (ar.data && st)
+        memcpy(st, ar.data, sizeof(*st));
+    return 0;
+}
+
+static int async_nfs_statvfs(struct nfs_context *ctx, const char *path,
+                              struct statvfs *st)
+{
+    struct async_result ar = {0};
+    int rc;
+
+    pthread_mutex_lock(&g_state.meta_lock);
+    rc = nfs_statvfs_async(ctx, path, async_generic_cb, &ar);
+    if (rc != 0) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        return rc;
+    }
+
+    rc = async_event_loop(ctx, &ar);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
+    if (rc != 0)
+        return rc;
+    if (ar.err < 0)
+        return ar.err;
+    if (ar.data && st)
+        memcpy(st, ar.data, sizeof(*st));
+    return 0;
+}
+
+/* --- Async META_RETRY: same retry logic but using async event loop --- */
+#define ASYNC_META_RETRY(rc, op, path, async_call) do {                  \
+    int _retries = 0;                                                    \
+    int _did_reconnect = 0;                                              \
+    for (;;) {                                                           \
+        if (g_state.dead_triggered) { (rc) = -EIO; break; }              \
+        (rc) = (async_call);                                             \
+        if ((rc) >= 0) {                                                 \
+            dead_timeout_on_success();                                    \
+            if (_retries > 0 && g_log_errors)                            \
+                syslog(LOG_NOTICE, "%s %s recovered after %d retries",   \
+                       (op), (path) ? (path) : "", _retries);            \
+            break;                                                       \
+        }                                                                \
+        dead_timeout_on_failure();                                       \
+        if (g_state.dead_triggered) { (rc) = -EIO; break; }              \
+        int _cls = classify_nfs_error(rc);                               \
+        if (_cls == RETRY_NONE || _retries >= g_nfs4_retry_max)          \
+            break;                                                       \
+        _retries++;                                                      \
+        if (_cls == RETRY_RECONNECT && !_did_reconnect) {                \
+            if (reconnect_meta_context((rc), (op), (path)) == 0)         \
+                _did_reconnect = 1;                                      \
+            else                                                         \
+                break;                                                   \
+        } else {                                                         \
+            DBG(1, "nfsfuse: %s on %s %s — waiting %ds (retry %d/%d)\n", \
+                reconnect_reason(rc), (op), (path) ? (path) : "",        \
+                g_nfs4_retry_wait, _retries, g_nfs4_retry_max);          \
+            if (g_log_errors)                                            \
+                syslog(LOG_WARNING, "%s on %s %s — retry %d/%d",         \
+                       reconnect_reason(rc), (op),                       \
+                       (path) ? (path) : "",                             \
+                       _retries, g_nfs4_retry_max);                      \
+            sleep(g_nfs4_retry_wait);                                    \
+        }                                                                \
+    }                                                                    \
+} while (0)
+
+/* --- End async infrastructure --- */
 
 /* --- Deferred close function implementations --- */
 
@@ -1512,7 +1870,15 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
         for (;;) {
             if (g_state.dead_triggered) { rc = -EIO; break; }
             if (g_state.has_dead_timeout) g_state.nfs_call_start = time(NULL);
-            rc = CALL_NFS_PREAD(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
+            if (g_async_mode && !h->own_ctx) {
+                file_handle_unlock(h);
+                rc = async_nfs_pread(file_handle_ctx(h), h->fh,
+                                     (uint64_t)(offset + (off_t)done),
+                                     chunk, buf + done);
+                file_handle_lock(h);
+            } else {
+                rc = CALL_NFS_PREAD(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
+            }
             if (g_state.has_dead_timeout) g_state.nfs_call_start = 0;
             if (rc >= 0) {
                 dead_timeout_on_success();
@@ -1590,7 +1956,15 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
         for (;;) {
             if (g_state.dead_triggered) { rc = -EIO; break; }
             if (g_state.has_dead_timeout) g_state.nfs_call_start = time(NULL);
-            rc = CALL_NFS_PWRITE(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
+            if (g_async_mode && !h->own_ctx) {
+                file_handle_unlock(h);
+                rc = async_nfs_pwrite(file_handle_ctx(h), h->fh,
+                                      (uint64_t)(offset + (off_t)done),
+                                      chunk, buf + done);
+                file_handle_lock(h);
+            } else {
+                rc = CALL_NFS_PWRITE(file_handle_ctx(h), h->fh, offset + (off_t)done, chunk, buf + done);
+            }
             if (g_state.has_dead_timeout) g_state.nfs_call_start = 0;
             if (rc >= 0) {
                 dead_timeout_on_success();
@@ -2724,6 +3098,7 @@ static void usage(const char *prog)
         "  --noexec             Disallow execution of binaries on mount\n"
         "  --do-not-reconnect-on-stale    Disable auto-reconnect on ESTALE (on by default)\n"
         "  --do-not-reconnect-on-io-error Disable auto-reconnect on EIO (on by default)\n"
+        "  --async              Use async NFS event loop (prevents stuck-call freezes)\n"
         "  --writeback-cache    Enable kernel writeback cache (faster writes,\n"
         "                       risk of data loss on crash — see docs)\n"
         "  --version            Show version information\n\n"
@@ -2820,6 +3195,7 @@ static int is_nfsfuse_opt(const char *arg)
            strcmp(arg, "--do-not-reconnect-on-stale") == 0 ||
            strcmp(arg, "--do-not-reconnect-on-io-error") == 0 ||
            strcmp(arg, "--writeback-cache") == 0 ||
+           strcmp(arg, "--async") == 0 ||
            strcmp(arg, "--timeout") == 0 ||
            strcmp(arg, "--retrans") == 0 ||
            strcmp(arg, "--autoreconnect") == 0 ||
@@ -2931,6 +3307,8 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--do-not-reconnect-on-io-error") == 0)
             g_reconnect_on_io_error = 0;
         if (strcmp(argv[i], "--writeback-cache") == 0)
+        if (strcmp(argv[i], "--async") == 0)
+            g_async_mode = 1;
             g_writeback_cache = 1;
         if (is_nfsfuse_opt_with_value(argv[i]) && i + 1 < argc)
             i++;
@@ -2956,6 +3334,8 @@ int main(int argc, char *argv[])
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--max") == 0) {
             g_state.max_mode = 1;
+            continue;
+        if (strcmp(argv[i], "--async") == 0)
             continue;
         }
         if (strcmp(argv[i], "--debug") == 0) {
@@ -2984,6 +3364,10 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--do-not-reconnect-on-io-error") == 0)
             continue;
         if (strcmp(argv[i], "--writeback-cache") == 0)
+        if (strcmp(argv[i], "--async") == 0)
+            g_async_mode = 1;
+            continue;
+        if (strcmp(argv[i], "--async") == 0)
             continue;
 
         if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
