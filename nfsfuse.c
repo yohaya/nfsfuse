@@ -72,6 +72,7 @@
 static int g_debug = 0;
 static int g_log_errors = 0;
 static int g_syslog_open = 0;
+static char g_syslog_ident[256];  /* "nfsfuse[mountpoint]" for syslog */
 static int g_noatime = 0;
 static int g_nodiratime = 0;
 static int g_noexec = 0;
@@ -2769,10 +2770,7 @@ int main(int argc, char *argv[])
     if (g_debug)
         print_version();
 
-    if (g_log_errors || g_debug_syslog) {
-        openlog("nfsfuse", LOG_PID, LOG_DAEMON);
-        g_syslog_open = 1;
-    }
+    /* syslog is opened later, after mount_idx is known */
 
     if (pthread_mutex_init(&g_state.meta_lock, NULL) != 0) {
         fprintf(stderr, "pthread_mutex_init failed\n");
@@ -2854,6 +2852,16 @@ int main(int argc, char *argv[])
         usage(argv[0]);
         cleanup_app_state();
         return 1;
+    }
+
+    /* Open syslog with mountpoint in the ident so each mount's messages
+     * are distinguishable: "nfsfuse[/storage/us-at-cdimage][1234]: ..." */
+    if (g_log_errors || g_debug_syslog) {
+        const char *mp = argv[mount_idx];
+        snprintf(g_syslog_ident, sizeof(g_syslog_ident),
+                 "nfsfuse[%s]", mp);
+        openlog(g_syslog_ident, LOG_PID, LOG_DAEMON);
+        g_syslog_open = 1;
     }
 
     g_state.url_base = xstrdup(argv[url_idx]);
