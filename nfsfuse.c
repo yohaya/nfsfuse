@@ -252,9 +252,16 @@ static struct app_state g_state = {0};
 
 static int nfs_err(int rc)
 {
-    if (rc < 0)
-        return rc;
-    return -EIO;
+    if (rc >= 0)
+        return -EIO;
+    /*
+     * libnfs maps NFS4ERR_EXPIRED/GRACE/STALE_CLIENTID to ERANGE (-34).
+     * ERANGE is not a meaningful I/O error for applications — they don't
+     * know what "Numerical result out of range" means.  Map it to EIO.
+     */
+    if (rc == -ERANGE)
+        return -EIO;
+    return rc;
 }
 
 static int nfs_err_log(int rc, const char *op, const char *path,
@@ -1373,9 +1380,18 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
             }
             dead_timeout_on_failure();
             if (g_state.dead_triggered) { rc = -EIO; break; }
-            if (classify_nfs_error(rc) == RETRY_NONE ||
-                io_retries >= NFS4_RETRY_MAX)
+            int _rcls = classify_nfs_error(rc);
+            if (_rcls == RETRY_NONE || io_retries >= NFS4_RETRY_MAX)
                 break;
+            if (_rcls == RETRY_RECONNECT) {
+                /* NFS4 session expired — reconnect so metadata/reopens
+                 * work, but this fh is dead, return EIO */
+                file_handle_unlock(h);
+                reconnect_meta_context(rc, "read", NULL);
+                file_handle_lock(h);
+                rc = -EIO;
+                break;
+            }
             io_retries++;
             DBG(1, "nfsfuse: read transient error — waiting %ds (retry %d/%d)\n",
                 NFS4_RETRY_WAIT_SEC, io_retries, NFS4_RETRY_MAX);
@@ -1431,9 +1447,18 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
             }
             dead_timeout_on_failure();
             if (g_state.dead_triggered) { rc = -EIO; break; }
-            if (classify_nfs_error(rc) == RETRY_NONE ||
-                io_retries >= NFS4_RETRY_MAX)
+            int _wcls = classify_nfs_error(rc);
+            if (_wcls == RETRY_NONE || io_retries >= NFS4_RETRY_MAX)
                 break;
+            if (_wcls == RETRY_RECONNECT) {
+                /* NFS4 session expired — reconnect so metadata/reopens
+                 * work, but this fh is dead, return EIO */
+                file_handle_unlock(h);
+                reconnect_meta_context(rc, "write", NULL);
+                file_handle_lock(h);
+                rc = -EIO;
+                break;
+            }
             io_retries++;
             DBG(1, "nfsfuse: write transient error — waiting %ds (retry %d/%d)\n",
                 NFS4_RETRY_WAIT_SEC, io_retries, NFS4_RETRY_MAX);
