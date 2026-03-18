@@ -1381,15 +1381,18 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
             dead_timeout_on_failure();
             if (g_state.dead_triggered) { rc = -EIO; break; }
             int _rcls = classify_nfs_error(rc);
-            if (_rcls == RETRY_NONE || io_retries >= NFS4_RETRY_MAX)
+            if (_rcls == RETRY_NONE)
                 break;
-            if (_rcls == RETRY_RECONNECT) {
-                /* NFS4 session expired — reconnect so metadata/reopens
-                 * work, but this fh is dead, return EIO */
-                file_handle_unlock(h);
-                reconnect_meta_context(rc, "read", NULL);
-                file_handle_lock(h);
-                rc = -EIO;
+            if (io_retries >= NFS4_RETRY_MAX) {
+                /* Retries exhausted.  If this was RETRY_RECONNECT
+                 * (NFS4ERR_EXPIRED/GRACE), reconnect so subsequent
+                 * metadata/reopens work on a fresh session. */
+                if (_rcls == RETRY_RECONNECT) {
+                    file_handle_unlock(h);
+                    reconnect_meta_context(rc, "read", NULL);
+                    file_handle_lock(h);
+                    rc = -EIO;
+                }
                 break;
             }
             io_retries++;
@@ -1448,15 +1451,18 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
             dead_timeout_on_failure();
             if (g_state.dead_triggered) { rc = -EIO; break; }
             int _wcls = classify_nfs_error(rc);
-            if (_wcls == RETRY_NONE || io_retries >= NFS4_RETRY_MAX)
+            if (_wcls == RETRY_NONE)
                 break;
-            if (_wcls == RETRY_RECONNECT) {
-                /* NFS4 session expired — reconnect so metadata/reopens
-                 * work, but this fh is dead, return EIO */
-                file_handle_unlock(h);
-                reconnect_meta_context(rc, "write", NULL);
-                file_handle_lock(h);
-                rc = -EIO;
+            if (io_retries >= NFS4_RETRY_MAX) {
+                /* Retries exhausted.  If this was RETRY_RECONNECT
+                 * (NFS4ERR_EXPIRED/GRACE), reconnect so subsequent
+                 * metadata/reopens work on a fresh session. */
+                if (_wcls == RETRY_RECONNECT) {
+                    file_handle_unlock(h);
+                    reconnect_meta_context(rc, "write", NULL);
+                    file_handle_lock(h);
+                    rc = -EIO;
+                }
                 break;
             }
             io_retries++;
