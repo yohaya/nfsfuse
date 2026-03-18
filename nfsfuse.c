@@ -563,6 +563,28 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
         return -1;
     }
 
+    /*
+     * Flush the deferred close pool BEFORE swapping contexts.
+     * Deferred entries hold ctx/fh pointers from the old session.
+     * After reconnect, those pointers reference a dead NFS session
+     * and using them causes segfaults (use-after-free in libnfs).
+     * We can't properly close them (old session is dead), so just
+     * mark them inactive and abandon the handles.
+     */
+    {
+        int _i;
+        pthread_mutex_lock(&g_deferred_lock);
+        for (_i = 0; _i < DEFERRED_CLOSE_MAX; _i++) {
+            if (g_deferred[_i].active) {
+                DBG(1, "nfsfuse: reconnect: discarding deferred handle %s\n",
+                    g_deferred[_i].path);
+                /* Don't nfs_close — old context is dead, would crash */
+                g_deferred[_i].active = 0;
+            }
+        }
+        pthread_mutex_unlock(&g_deferred_lock);
+    }
+
     pthread_mutex_lock(&g_state.meta_lock);
     /* Do not destroy old context — open file handles still reference it.
      * Those handles will get NFS errors and the application will reopen. */
