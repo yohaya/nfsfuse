@@ -2709,7 +2709,7 @@ static void usage(const char *prog)
         "  --autoreconnect <n>  TCP reconnect attempts on disconnect (-1=infinite, default: 0)\n"
         "  --tcp-syncnt <n>     TCP SYN retry count for connection establishment\n"
         "  --poll-timeout <ms>  Poll interval in milliseconds between response checks\n"
-        "  --dead-timeout <s>   Unmount after N seconds of consecutive failures (default: disabled)
+        "  --dead-timeout <s>   Unmount after N seconds of consecutive failures (default: disabled)\n"
         "  --stuck-timeout <s>  Recover stuck NFS calls by shutting down socket (default: disabled)\n"
         "  --nfs4-retries <n>   NFS4 error retry attempts (default: 5)\n"
         "  --nfs4-retry-wait <s> Seconds between NFS4 retries (default: 30)\n\n"
