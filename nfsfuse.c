@@ -308,9 +308,16 @@ static void deferred_close_add(const char *path, struct nfs_context *ctx,
 
     if (g_deferred[oldest].active) {
         DBG(2, "nfsfuse: deferred close evict %s\n", g_deferred[oldest].path);
-        pthread_mutex_lock(&g_state.meta_lock);
-        nfs_close(g_deferred[oldest].ctx, g_deferred[oldest].fh);
-        pthread_mutex_unlock(&g_state.meta_lock);
+        if (pthread_mutex_trylock(&g_state.meta_lock) == 0) {
+            nfs_close(g_deferred[oldest].ctx, g_deferred[oldest].fh);
+            pthread_mutex_unlock(&g_state.meta_lock);
+        } else {
+            /* meta_lock busy — abandon the handle to avoid blocking
+             * the FUSE thread.  Small resource leak but prevents
+             * the mount from freezing during pool thrashing. */
+            DBG(1, "nfsfuse: deferred close evict: meta_lock busy, "
+                   "abandoning handle %s\n", g_deferred[oldest].path);
+        }
     }
 
     snprintf(g_deferred[oldest].path, sizeof(g_deferred[oldest].path),
