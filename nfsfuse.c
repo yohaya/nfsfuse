@@ -1077,16 +1077,24 @@ static void *keepalive_thread_func(void *arg)
 
                 if (stuck_secs >= g_state.stuck_timeout && g_state.meta_nfs) {
                     int nfs_fd = nfs_get_fd(g_state.meta_nfs);
+                    DBG(1, "nfsfuse: stuck-call recovery: killing NFS "
+                           "socket (fd=%d) after %lds\n",
+                        nfs_fd, stuck_secs);
+                    if (g_log_errors)
+                        syslog(LOG_WARNING,
+                               "stuck NFS call for %ld seconds "
+                               "— killing socket to recover",
+                               stuck_secs);
+                    /*
+                     * Disable autoreconnect FIRST so libnfs doesn't
+                     * create a new socket after we kill this one.
+                     * Then shutdown + close the fd to unblock any
+                     * blocking syscall (poll, recv, send, connect).
+                     */
+                    nfs_set_autoreconnect(g_state.meta_nfs, 0);
                     if (nfs_fd >= 0) {
-                        DBG(1, "nfsfuse: stuck-call recovery: shutting down "
-                               "NFS socket (fd=%d) after %lds\n",
-                            nfs_fd, stuck_secs);
-                        if (g_log_errors)
-                            syslog(LOG_WARNING,
-                                   "stuck NFS call for %ld seconds "
-                                   "— shutting down socket to recover",
-                                   stuck_secs);
                         shutdown(nfs_fd, SHUT_RDWR);
+                        close(nfs_fd);
                     }
                     g_state.meta_lock_busy_since = 0;
                 }
