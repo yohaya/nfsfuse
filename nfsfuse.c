@@ -122,10 +122,22 @@ static void log_nfs_error(const char *op, const char *path,
         return;
     }
 
+    /*
+     * Retriable errors (ERANGE=NFS4ERR_EXPIRED/GRACE, ETIMEDOUT,
+     * ESTALE) are logged by the retry loop itself (META_RETRY,
+     * pread_full, pwrite_full) with retry counts and recovery status.
+     * Don't duplicate them here — only log non-retriable errors.
+     */
+    if (classify_nfs_error(rc) != RETRY_NONE) {
+        DBG(1, "nfsfuse: %s %s: %s (rc=%d/%s) [will retry]\n",
+            op, path ? path : "", nfs_msg, rc, strerror(-rc));
+        return;
+    }
+
     if (!g_log_errors)
         return;
 
-    priority = (rc == -ETIMEDOUT) ? LOG_WARNING : LOG_ERR;
+    priority = LOG_ERR;
 
     syslog(priority, "%s %s: %s (rc=%d/%s)",
            op, path ? path : "",
