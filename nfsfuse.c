@@ -3327,11 +3327,11 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--do-not-reconnect-on-io-error") == 0)
             g_reconnect_on_io_error = 0;
         if (strcmp(argv[i], "--writeback-cache") == 0)
+            g_writeback_cache = 1;
         if (strcmp(argv[i], "--async") == 0)
             g_async_mode = 1;
         if (strcmp(argv[i], "--auto-remount") == 0)
             g_auto_remount = 1;
-            g_writeback_cache = 1;
         if (is_nfsfuse_opt_with_value(argv[i]) && i + 1 < argc)
             i++;
     }
@@ -3390,12 +3390,6 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--do-not-reconnect-on-io-error") == 0)
             continue;
         if (strcmp(argv[i], "--writeback-cache") == 0)
-        if (strcmp(argv[i], "--async") == 0)
-            g_async_mode = 1;
-        if (strcmp(argv[i], "--auto-remount") == 0)
-            g_auto_remount = 1;
-            continue;
-        if (strcmp(argv[i], "--auto-remount") == 0)
             continue;
         if (strcmp(argv[i], "--async") == 0)
             continue;
