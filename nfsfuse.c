@@ -610,11 +610,9 @@ static int async_nfs_pread(struct nfs_context *ctx, struct nfsfh *fh,
         ar->abandoned = 1;  /* callback may fire later — don't free */
         return rc;
     }
-    if (ar->err < 0)
-        return ar->err;
     rc = ar->err;
     free(ar);
-    return rc;  /* bytes read; data written directly to buf */
+    return rc;  /* bytes read (>=0), or negative errno */
 }
 
 static int async_nfs_pwrite(struct nfs_context *ctx, struct nfsfh *fh,
@@ -4007,12 +4005,6 @@ int main(int argc, char *argv[])
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--max") == 0) {
             g_state.max_mode = 1;
-            continue;
-        if (strcmp(argv[i], "--auto-remount") == 0)
-            continue;
-        if (strcmp(argv[i], "--async") == 0)
-            continue;
-        if (strcmp(argv[i], "--auto-remount") == 0)
             continue;
         }
         if (strcmp(argv[i], "--debug") == 0) {
