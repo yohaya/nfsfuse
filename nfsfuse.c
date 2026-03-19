@@ -318,8 +318,9 @@ static struct nfs_context *mount_new_context(const char *url);
 
 struct async_result {
     int done;
-    int err;     /* negative errno on error, or bytes for read/write */
-    void *data;  /* operation-specific result (stat, fh, etc.) */
+    int err;        /* negative errno on error, or bytes for read/write */
+    void *data;     /* operation-specific result (stat, fh, etc.) */
+    int abandoned;  /* 1 = caller timed out, callback should do nothing */
 };
 
 static void async_generic_cb(int err, struct nfs_context *nfs,
@@ -327,6 +328,17 @@ static void async_generic_cb(int err, struct nfs_context *nfs,
 {
     struct async_result *ar = (struct async_result *)private_data;
     (void)nfs;
+
+    if (ar->abandoned) {
+        /*
+         * The caller already timed out and returned.  The ar was
+         * heap-allocated specifically for this case — free it now.
+         * Do NOT touch ar->data — it belongs to libnfs.
+         */
+        free(ar);
+        return;
+    }
+
     ar->err = err;
     ar->data = data;
     ar->done = 1;
@@ -424,211 +436,264 @@ static int async_event_loop(struct nfs_context *ctx, struct async_result *ar)
 static int async_nfs_lstat64(struct nfs_context *ctx, const char *path,
                               struct nfs_stat_64 *st)
 {
-    struct async_result ar = {0};
+    struct async_result *ar = calloc(1, sizeof(*ar));
     int rc;
 
+    if (!ar) return -ENOMEM;
+
     pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_lstat64_async(ctx, path, async_generic_cb, &ar);
+    rc = nfs_lstat64_async(ctx, path, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
         return rc;
     }
 
-    rc = async_event_loop(ctx, &ar);
+    rc = async_event_loop(ctx, ar);
+
     pthread_mutex_unlock(&g_state.meta_lock);
 
-    if (rc != 0)
+    if (rc != 0) {
+        /* Timeout or error — callback may fire later, mark abandoned */
+        ar->abandoned = 1;
         return rc;
-    if (ar.err < 0)
-        return ar.err;
-    if (ar.data && st)
-        memcpy(st, ar.data, sizeof(*st));
+    }
+    if (ar->err < 0) {
+        rc = ar->err;
+        free(ar);
+        return rc;
+    }
+    if (ar->data && st)
+        memcpy(st, ar->data, sizeof(*st));
+    free(ar);
     return 0;
 }
 
 static int async_nfs_open(struct nfs_context *ctx, const char *path,
                            int flags, struct nfsfh **fh_out)
 {
-    struct async_result ar = {0};
+    struct async_result *ar = calloc(1, sizeof(*ar));
     int rc;
 
+    if (!ar) return -ENOMEM;
+
     pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_open_async(ctx, path, flags, async_generic_cb, &ar);
+    rc = nfs_open_async(ctx, path, flags, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
         return rc;
     }
 
-    rc = async_event_loop(ctx, &ar);
+    rc = async_event_loop(ctx, ar);
     pthread_mutex_unlock(&g_state.meta_lock);
 
-    if (rc != 0)
+    if (rc != 0) {
+        ar->abandoned = 1;  /* callback may fire later — don't free */
         return rc;
-    if (ar.err < 0)
-        return ar.err;
+    }
+    if (ar->err < 0)
+        return ar->err;
     if (fh_out)
-        *fh_out = (struct nfsfh *)ar.data;
+        *fh_out = (struct nfsfh *)ar->data;
+    free(ar);
     return 0;
 }
 
 static int async_nfs_creat(struct nfs_context *ctx, const char *path,
                             int mode, struct nfsfh **fh_out)
 {
-    struct async_result ar = {0};
+    struct async_result *ar = calloc(1, sizeof(*ar));
     int rc;
 
+    if (!ar) return -ENOMEM;
+
     pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_creat_async(ctx, path, mode, async_generic_cb, &ar);
+    rc = nfs_creat_async(ctx, path, mode, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
         return rc;
     }
 
-    rc = async_event_loop(ctx, &ar);
+    rc = async_event_loop(ctx, ar);
     pthread_mutex_unlock(&g_state.meta_lock);
 
-    if (rc != 0)
+    if (rc != 0) {
+        ar->abandoned = 1;  /* callback may fire later — don't free */
         return rc;
-    if (ar.err < 0)
-        return ar.err;
+    }
+    if (ar->err < 0)
+        return ar->err;
     if (fh_out)
-        *fh_out = (struct nfsfh *)ar.data;
+        *fh_out = (struct nfsfh *)ar->data;
+    free(ar);
     return 0;
 }
 
 static int async_nfs_close(struct nfs_context *ctx, struct nfsfh *fh)
 {
-    struct async_result ar = {0};
+    struct async_result *ar = calloc(1, sizeof(*ar));
     int rc;
 
+    if (!ar) return -ENOMEM;
+
     pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_close_async(ctx, fh, async_generic_cb, &ar);
+    rc = nfs_close_async(ctx, fh, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
         return rc;
     }
 
-    rc = async_event_loop(ctx, &ar);
+    rc = async_event_loop(ctx, ar);
     pthread_mutex_unlock(&g_state.meta_lock);
 
-    if (rc != 0)
+    if (rc != 0) {
+        ar->abandoned = 1;  /* callback may fire later — don't free */
         return rc;
-    return ar.err < 0 ? ar.err : 0;
+    }
+    rc = ar->err < 0 ? ar->err : 0;
+    free(ar);
+    return rc;
 }
 
 static int async_nfs_pread(struct nfs_context *ctx, struct nfsfh *fh,
                             uint64_t offset, size_t count, char *buf)
 {
-    struct async_result ar = {0};
+    struct async_result *ar = calloc(1, sizeof(*ar));
     int rc;
+
+    if (!ar) return -ENOMEM;
 
     pthread_mutex_lock(&g_state.meta_lock);
     rc = nfs_pread_async(ctx, fh, (void *)buf, (size_t)count,
-                         (uint64_t)offset, async_generic_cb, &ar);
+                         (uint64_t)offset, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
         return rc;
     }
 
-    rc = async_event_loop(ctx, &ar);
+    rc = async_event_loop(ctx, ar);
     pthread_mutex_unlock(&g_state.meta_lock);
 
-    if (rc != 0)
+    if (rc != 0) {
+        ar->abandoned = 1;  /* callback may fire later — don't free */
         return rc;
-    if (ar.err < 0)
-        return ar.err;
-    return ar.err;  /* bytes read; data written directly to buf */
+    }
+    if (ar->err < 0)
+        return ar->err;
+    rc = ar->err;
+    free(ar);
+    return rc;  /* bytes read; data written directly to buf */
 }
 
 static int async_nfs_pwrite(struct nfs_context *ctx, struct nfsfh *fh,
                              uint64_t offset, size_t count, const char *buf)
 {
-    struct async_result ar = {0};
+    struct async_result *ar = calloc(1, sizeof(*ar));
     int rc;
+
+    if (!ar) return -ENOMEM;
 
     pthread_mutex_lock(&g_state.meta_lock);
     rc = nfs_pwrite_async(ctx, fh, (const void *)buf, (size_t)count,
-                          (uint64_t)offset, async_generic_cb, &ar);
+                          (uint64_t)offset, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
         return rc;
     }
 
-    rc = async_event_loop(ctx, &ar);
+    rc = async_event_loop(ctx, ar);
     pthread_mutex_unlock(&g_state.meta_lock);
 
-    if (rc != 0)
+    if (rc != 0) {
+        ar->abandoned = 1;  /* callback may fire later — don't free */
         return rc;
-    return ar.err;  /* bytes written, or negative errno */
+    }
+    rc = ar->err;
+    free(ar);
+    return rc;  /* bytes written, or negative errno */
 }
 
 static int async_nfs_fsync(struct nfs_context *ctx, struct nfsfh *fh)
 {
-    struct async_result ar = {0};
+    struct async_result *ar = calloc(1, sizeof(*ar));
     int rc;
 
+    if (!ar) return -ENOMEM;
+
     pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_fsync_async(ctx, fh, async_generic_cb, &ar);
+    rc = nfs_fsync_async(ctx, fh, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
         return rc;
     }
 
-    rc = async_event_loop(ctx, &ar);
+    rc = async_event_loop(ctx, ar);
     pthread_mutex_unlock(&g_state.meta_lock);
 
-    if (rc != 0)
+    if (rc != 0) {
+        ar->abandoned = 1;  /* callback may fire later — don't free */
         return rc;
-    return ar.err < 0 ? ar.err : 0;
+    }
+    rc = ar->err < 0 ? ar->err : 0;
+    free(ar);
+    return rc;
 }
 
 static int async_nfs_fstat64(struct nfs_context *ctx, struct nfsfh *fh,
                               struct nfs_stat_64 *st)
 {
-    struct async_result ar = {0};
+    struct async_result *ar = calloc(1, sizeof(*ar));
     int rc;
 
+    if (!ar) return -ENOMEM;
+
     pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_fstat64_async(ctx, fh, async_generic_cb, &ar);
+    rc = nfs_fstat64_async(ctx, fh, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
         return rc;
     }
 
-    rc = async_event_loop(ctx, &ar);
+    rc = async_event_loop(ctx, ar);
     pthread_mutex_unlock(&g_state.meta_lock);
 
-    if (rc != 0)
+    if (rc != 0) {
+        ar->abandoned = 1;  /* callback may fire later — don't free */
         return rc;
-    if (ar.err < 0)
-        return ar.err;
-    if (ar.data && st)
-        memcpy(st, ar.data, sizeof(*st));
+    }
+    if (ar->err < 0)
+        return ar->err;
+    if (ar->data && st)
+        memcpy(st, ar->data, sizeof(*st));
     return 0;
 }
 
 static int async_nfs_statvfs(struct nfs_context *ctx, const char *path,
                               struct statvfs *st)
 {
-    struct async_result ar = {0};
+    struct async_result *ar = calloc(1, sizeof(*ar));
     int rc;
 
+    if (!ar) return -ENOMEM;
+
     pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_statvfs_async(ctx, path, async_generic_cb, &ar);
+    rc = nfs_statvfs_async(ctx, path, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
         return rc;
     }
 
-    rc = async_event_loop(ctx, &ar);
+    rc = async_event_loop(ctx, ar);
     pthread_mutex_unlock(&g_state.meta_lock);
 
-    if (rc != 0)
+    if (rc != 0) {
+        ar->abandoned = 1;  /* callback may fire later — don't free */
         return rc;
-    if (ar.err < 0)
-        return ar.err;
-    if (ar.data && st)
-        memcpy(st, ar.data, sizeof(*st));
+    }
+    if (ar->err < 0)
+        return ar->err;
+    if (ar->data && st)
+        memcpy(st, ar->data, sizeof(*st));
     return 0;
 }
 
