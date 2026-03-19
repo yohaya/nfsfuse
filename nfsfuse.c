@@ -324,6 +324,8 @@ struct async_result {
     int err;        /* negative errno on error, or bytes for read/write */
     void *data;     /* operation-specific result (stat, fh, etc.) */
     int abandoned;  /* 1 = caller timed out, callback should do nothing */
+    void *copy_dst; /* if set, callback copies data here immediately */
+    size_t copy_len;/* size of copy_dst buffer */
 };
 
 static void async_generic_cb(int err, struct nfs_context *nfs,
@@ -343,6 +345,13 @@ static void async_generic_cb(int err, struct nfs_context *nfs,
         err, data, (void *)ar);
     ar->err = err;
     ar->data = data;
+
+    /* Copy data immediately while libnfs buffer is still valid.
+     * For stat/statvfs, the data pointer is only valid during
+     * this callback — libnfs may reuse the buffer after return. */
+    if (ar->copy_dst && data && err >= 0)
+        memcpy(ar->copy_dst, data, ar->copy_len);
+
     ar->done = 1;
 }
 
@@ -454,6 +463,12 @@ static int async_nfs_lstat64(struct nfs_context *ctx, const char *path,
 
     if (!ar) return -ENOMEM;
 
+    /* Copy stat data inside callback while libnfs buffer is valid */
+    if (st) {
+        ar->copy_dst = st;
+        ar->copy_len = sizeof(*st);
+    }
+
     pthread_mutex_lock(&g_state.meta_lock);
     rc = nfs_lstat64_async(ctx, path, async_generic_cb, ar);
     if (rc != 0) {
@@ -467,7 +482,6 @@ static int async_nfs_lstat64(struct nfs_context *ctx, const char *path,
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc != 0) {
-        /* Timeout or error — callback may fire later, mark abandoned */
         ar->abandoned = 1;
         return rc;
     }
@@ -476,8 +490,7 @@ static int async_nfs_lstat64(struct nfs_context *ctx, const char *path,
         free(ar);
         return rc;
     }
-    if (ar->data && st)
-        memcpy(st, ar->data, sizeof(*st));
+    /* Data already copied by callback via copy_dst */
     free(ar);
     return 0;
 }
@@ -660,6 +673,11 @@ static int async_nfs_fstat64(struct nfs_context *ctx, struct nfsfh *fh,
 
     if (!ar) return -ENOMEM;
 
+    if (st) {
+        ar->copy_dst = st;
+        ar->copy_len = sizeof(*st);
+    }
+
     pthread_mutex_lock(&g_state.meta_lock);
     rc = nfs_fstat64_async(ctx, fh, async_generic_cb, ar);
     if (rc != 0) {
@@ -671,13 +689,14 @@ static int async_nfs_fstat64(struct nfs_context *ctx, struct nfsfh *fh,
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc != 0) {
-        ar->abandoned = 1;  /* callback may fire later — don't free */
+        ar->abandoned = 1;
         return rc;
     }
-    if (ar->err < 0)
-        return ar->err;
-    if (ar->data && st)
-        memcpy(st, ar->data, sizeof(*st));
+    if (ar->err < 0) {
+        rc = ar->err;
+        free(ar);
+        return rc;
+    }
     return 0;
 }
 
@@ -688,6 +707,11 @@ static int async_nfs_statvfs(struct nfs_context *ctx, const char *path,
     int rc;
 
     if (!ar) return -ENOMEM;
+
+    if (st) {
+        ar->copy_dst = st;
+        ar->copy_len = sizeof(*st);
+    }
 
     pthread_mutex_lock(&g_state.meta_lock);
     rc = nfs_statvfs_async(ctx, path, async_generic_cb, ar);
@@ -700,13 +724,16 @@ static int async_nfs_statvfs(struct nfs_context *ctx, const char *path,
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc != 0) {
-        ar->abandoned = 1;  /* callback may fire later — don't free */
+        ar->abandoned = 1;
         return rc;
     }
-    if (ar->err < 0)
-        return ar->err;
-    if (ar->data && st)
-        memcpy(st, ar->data, sizeof(*st));
+    if (ar->err < 0) {
+        rc = ar->err;
+        free(ar);
+        return rc;
+    }
+    /* Data already copied by callback via copy_dst */
+    free(ar);
     return 0;
 }
 
