@@ -3211,8 +3211,15 @@ static void *nfuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
             DBG(1, "nfsfuse: WARNING: could not start watchdog thread\n");
     }
 
-    cfg->use_ino = 1;
-    cfg->readdir_ino = 1;
+    /*
+     * Do NOT use NFS server inode numbers — some NFS servers return
+     * duplicate st_ino for different directories after reconnect or
+     * across different NFS4 sessions. This causes 'find' and other
+     * tools to detect false "file system loops" and skip directories.
+     * Let FUSE generate unique inode numbers instead.
+     */
+    cfg->use_ino = 0;
+    cfg->readdir_ino = 0;
 
     if (g_state.safe_v4_mode) {
         cfg->kernel_cache = 0;
