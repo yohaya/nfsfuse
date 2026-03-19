@@ -349,6 +349,16 @@ static int async_event_loop(struct nfs_context *ctx, struct async_result *ar)
         struct pollfd pfd;
         int r;
 
+        /* Detect context swap (reconnect happened while we were waiting).
+         * If g_state.meta_nfs changed, our async request is orphaned on
+         * the old context.  Return error so the retry logic reconnects
+         * and retries with the new context. */
+        if (ctx != g_state.meta_nfs) {
+            DBG(1, "nfsfuse: async: NFS context changed (reconnect), "
+                   "aborting operation\n");
+            return -EAGAIN;
+        }
+
         pfd.fd = nfs_get_fd(ctx);
         pfd.events = nfs_which_events(ctx);
         pfd.revents = 0;
@@ -364,6 +374,13 @@ static int async_event_loop(struct nfs_context *ctx, struct async_result *ar)
         r = poll(&pfd, 1, ASYNC_POLL_MS);
 
         pthread_mutex_lock(&g_state.meta_lock);
+
+        /* Re-check context after reacquiring lock */
+        if (ctx != g_state.meta_nfs) {
+            DBG(1, "nfsfuse: async: NFS context changed during poll, "
+                   "aborting\n");
+            return -EAGAIN;
+        }
 
         if (r > 0) {
             /* Socket has data/events — process them */
