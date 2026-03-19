@@ -682,13 +682,12 @@ static void deferred_close_add(const char *path, struct nfs_context *ctx,
 
     if (g_deferred[oldest].active) {
         DBG(2, "nfsfuse: deferred close evict %s\n", g_deferred[oldest].path);
-        if (pthread_mutex_trylock(&g_state.meta_lock) == 0) {
+        if (g_async_mode) {
+            /* Async mode: abandon — nfs_close blocks on dead servers */
+        } else if (pthread_mutex_trylock(&g_state.meta_lock) == 0) {
             nfs_close(g_deferred[oldest].ctx, g_deferred[oldest].fh);
             pthread_mutex_unlock(&g_state.meta_lock);
         } else {
-            /* meta_lock busy — abandon the handle to avoid blocking
-             * the FUSE thread.  Small resource leak but prevents
-             * the mount from freezing during pool thrashing. */
             DBG(1, "nfsfuse: deferred close evict: meta_lock busy, "
                    "abandoning handle %s\n", g_deferred[oldest].path);
         }
@@ -737,7 +736,14 @@ static void deferred_close_expire(void)
         if (g_deferred[i].active &&
             (now - g_deferred[i].created) >= DEFERRED_CLOSE_SEC) {
             DBG(2, "nfsfuse: deferred close expire %s\n", g_deferred[i].path);
-            if (pthread_mutex_trylock(&g_state.meta_lock) == 0) {
+            if (g_async_mode) {
+                /* In async mode, just abandon the handle — don't risk
+                 * a blocking nfs_close() that freezes the mount.
+                 * The NFS server will reclaim it on lease expiry. */
+                DBG(2, "nfsfuse: deferred close: abandoning expired "
+                       "handle %s (async mode)\n", g_deferred[i].path);
+                g_deferred[i].active = 0;
+            } else if (pthread_mutex_trylock(&g_state.meta_lock) == 0) {
                 nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
                 pthread_mutex_unlock(&g_state.meta_lock);
                 g_deferred[i].active = 0;
