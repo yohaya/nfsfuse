@@ -330,15 +330,14 @@ static void async_generic_cb(int err, struct nfs_context *nfs,
     (void)nfs;
 
     if (ar->abandoned) {
-        /*
-         * The caller already timed out and returned.  The ar was
-         * heap-allocated specifically for this case — free it now.
-         * Do NOT touch ar->data — it belongs to libnfs.
-         */
+        DBG(4, "nfsfuse: async-cb: LATE callback (abandoned), "
+               "err=%d ar=%p — freeing\n", err, (void *)ar);
         free(ar);
         return;
     }
 
+    DBG(4, "nfsfuse: async-cb: callback fired, err=%d data=%p ar=%p\n",
+        err, data, (void *)ar);
     ar->err = err;
     ar->data = data;
     ar->done = 1;
@@ -357,17 +356,18 @@ static int async_event_loop(struct nfs_context *ctx, struct async_result *ar)
     time_t start = time(NULL);
     int timeout = g_state.stuck_timeout > 0 ? g_state.stuck_timeout : 120;
 
+    DBG(4, "nfsfuse: async-loop: enter ctx=%p meta_nfs=%p ar=%p\n",
+        (void *)ctx, (void *)g_state.meta_nfs, (void *)ar);
+
     while (!ar->done && !g_state.dead_triggered) {
         struct pollfd pfd;
         int r;
+        int elapsed = (int)(time(NULL) - start);
 
-        /* Detect context swap (reconnect happened while we were waiting).
-         * If g_state.meta_nfs changed, our async request is orphaned on
-         * the old context.  Return error so the retry logic reconnects
-         * and retries with the new context. */
+        /* Detect context swap (reconnect happened while we were waiting) */
         if (ctx != g_state.meta_nfs) {
-            DBG(1, "nfsfuse: async: NFS context changed (reconnect), "
-                   "aborting operation\n");
+            DBG(1, "nfsfuse: async: NFS context CHANGED ctx=%p new=%p "
+                   "— aborting\n", (void *)ctx, (void *)g_state.meta_nfs);
             return -EAGAIN;
         }
 
@@ -376,9 +376,12 @@ static int async_event_loop(struct nfs_context *ctx, struct async_result *ar)
         pfd.revents = 0;
 
         if (pfd.fd < 0) {
-            /* Context has no socket — connection lost */
+            DBG(4, "nfsfuse: async-loop: fd<0, connection lost\n");
             return -EIO;
         }
+
+        DBG(4, "nfsfuse: async-loop: poll fd=%d elapsed=%ds/%ds\n",
+            pfd.fd, elapsed, timeout);
 
         /* Release lock during poll so watchdog/keepalive can run */
         pthread_mutex_unlock(&g_state.meta_lock);
@@ -389,18 +392,25 @@ static int async_event_loop(struct nfs_context *ctx, struct async_result *ar)
 
         /* Re-check context after reacquiring lock */
         if (ctx != g_state.meta_nfs) {
-            DBG(1, "nfsfuse: async: NFS context changed during poll, "
-                   "aborting\n");
+            DBG(1, "nfsfuse: async: context changed during poll "
+                   "ctx=%p new=%p\n",
+                (void *)ctx, (void *)g_state.meta_nfs);
             return -EAGAIN;
         }
 
         if (r > 0) {
-            /* Socket has data/events — process them */
+            DBG(4, "nfsfuse: async-loop: poll ready, servicing "
+                   "revents=0x%x\n", pfd.revents);
             if (nfs_service(ctx, pfd.revents) != 0) {
                 DBG(1, "nfsfuse: async: nfs_service error\n");
                 return -EIO;
             }
-        } else if (r < 0 && errno != EINTR) {
+            DBG(4, "nfsfuse: async-loop: service done, "
+                   "ar->done=%d ar->err=%d\n", ar->done, ar->err);
+        } else if (r == 0) {
+            DBG(4, "nfsfuse: async-loop: poll timeout (5s), "
+                   "elapsed=%ds/%ds\n", elapsed, timeout);
+        } else if (errno != EINTR) {
             DBG(1, "nfsfuse: async: poll error: %s\n", strerror(errno));
             return -EIO;
         }
@@ -1113,7 +1123,12 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
                 shutdown(old_fd, SHUT_RDWR);
         }
     }
-    g_state.meta_nfs = new_ctx;
+    {
+        struct nfs_context *old = g_state.meta_nfs;
+        g_state.meta_nfs = new_ctx;
+        DBG(4, "nfsfuse: reconnect: swapped ctx old=%p new=%p\n",
+            (void *)old, (void *)new_ctx);
+    }
     pthread_mutex_unlock(&g_state.meta_lock);
 
     DBG(1, "nfsfuse: reconnected successfully\n");
@@ -3305,6 +3320,7 @@ static void usage(const char *prog)
         "                         1 = mount/config/reconnect info\n"
         "                         2 = all FUSE operations (path + result)\n"
         "                         3 = detailed parameters (offsets, sizes, flags, modes)\n"
+        "                         4 = async internals (lock, context, callback, event loop)\n"
         "  --debug-output <dst> Send debug output to <dst> instead of stderr\n"
         "                         syslog = write to syslog (daemon.debug)\n"
         "                         <path> = write to file (e.g. /var/log/nfsfuse.log)\n"
