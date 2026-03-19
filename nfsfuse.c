@@ -194,6 +194,7 @@ struct app_state {
     int dead_timeout;        /* 0 = disabled */
     int has_dead_timeout;
     long long first_failure_ms;  /* millisecond time of first consecutive failure, 0 = healthy */
+    int failure_logged;          /* 1 = "connectivity lost" was logged for this outage */
     int dead_triggered;      /* 1 = already triggered unmount */
 
     /* Stuck-call recovery: shut down socket after N seconds of meta_lock busy */
@@ -847,6 +848,10 @@ static long long now_ms(void)
     return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
+/* Minimum outage duration (ms) before logging connectivity lost/restored.
+ * Prevents syslog spam from sub-second transient NFS errors. */
+#define MIN_OUTAGE_LOG_MS 3000
+
 static void dead_timeout_on_failure(void)
 {
     long long now;
@@ -858,13 +863,21 @@ static void dead_timeout_on_failure(void)
 
     if (g_state.first_failure_ms == 0) {
         g_state.first_failure_ms = now;
-        DBG(1, "nfsfuse: dead-timeout watchdog started (limit %ds)\n",
-            g_state.dead_timeout);
+        /* Don't log immediately — wait to see if it's a real outage */
+        DBG(2, "nfsfuse: dead-timeout: failure detected, monitoring...\n");
+        return;
+    }
+
+    /* Log "connectivity lost" only after the outage persists >= 3 seconds */
+    if (!g_state.failure_logged &&
+        (now - g_state.first_failure_ms) >= MIN_OUTAGE_LOG_MS) {
+        g_state.failure_logged = 1;
+        DBG(1, "nfsfuse: connectivity lost (persistent) — will unmount "
+               "after %ds\n", g_state.dead_timeout);
         if (g_log_errors)
             syslog(LOG_WARNING,
                    "connectivity lost — will unmount after %d seconds",
                    g_state.dead_timeout);
-        return;
     }
 
     if ((now - g_state.first_failure_ms) >= (long long)g_state.dead_timeout * 1000) {
@@ -890,13 +903,22 @@ static void dead_timeout_on_success(void)
 
     if (g_state.first_failure_ms != 0) {
         long long elapsed_ms = now_ms() - g_state.first_failure_ms;
-        DBG(1, "nfsfuse: dead-timeout watchdog reset — server responded "
-               "after %lld.%03llds\n", elapsed_ms / 1000, elapsed_ms % 1000);
-        if (g_log_errors)
-            syslog(LOG_NOTICE, "connectivity restored after %lld.%03lld seconds",
-                   elapsed_ms / 1000, elapsed_ms % 1000);
+        /* Only log restoration if the outage was significant enough
+         * to have been logged as "connectivity lost" */
+        if (g_state.failure_logged) {
+            DBG(1, "nfsfuse: connectivity restored after %lld.%03llds\n",
+                elapsed_ms / 1000, elapsed_ms % 1000);
+            if (g_log_errors)
+                syslog(LOG_NOTICE,
+                       "connectivity restored after %lld.%03lld seconds",
+                       elapsed_ms / 1000, elapsed_ms % 1000);
+        } else {
+            DBG(2, "nfsfuse: transient failure cleared after %lld.%03llds\n",
+                elapsed_ms / 1000, elapsed_ms % 1000);
+        }
     }
     g_state.first_failure_ms = 0;
+    g_state.failure_logged = 0;
 }
 
 static int classify_nfs_error(int rc)
