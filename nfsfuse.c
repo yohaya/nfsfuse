@@ -1505,19 +1505,29 @@ static void apply_nfs_tuning(struct nfs_context *ctx)
     }
     if (g_state.has_autoreconnect) {
         /*
-         * For NFS4, TCP-level autoreconnect is dangerous: it silently
-         * creates a new NFS4 session (new clientid), invalidating all
-         * stateids from the old session.  Open file handles still
-         * reference the old context and will get errors.  Limit
-         * autoreconnect to at most 3 attempts for NFS4 to allow
-         * transient recovery without endless silent state loss.
+         * For NFS4, disable libnfs internal autoreconnect entirely.
+         * libnfs autoreconnect silently creates a new NFS4 session
+         * (new clientid) WITHIN the same nfs_context pointer.  This
+         * makes the session change invisible to our code — we compare
+         * h->open_ctx to g_state.meta_nfs (pointer comparison) to
+         * detect stale file handles, but the pointer never changes.
+         * Result: file handles with dead stateids never get reopened,
+         * and reads/writes hang forever while keepalive (path-based)
+         * still works.
+         *
+         * With autoreconnect=0, any connection loss causes libnfs calls
+         * to fail immediately.  Our META_RETRY / pread_full / pwrite_full
+         * logic catches the error and calls reconnect_meta_context(),
+         * which creates a NEW nfs_context pointer — making the session
+         * change visible to all detection logic.
          */
         int ar = g_state.autoreconnect;
-        if (g_state.safe_v4_mode && ar > 3)
-            ar = 3;
+        if (g_state.safe_v4_mode)
+            ar = 0;
         nfs_set_autoreconnect(ctx, ar);
         DBG(1, "  autoreconnect=%d%s\n", ar,
-            (ar != g_state.autoreconnect) ? " (capped for NFS4)" : "");
+            (g_state.safe_v4_mode) ? " (disabled for NFS4 — reconnects via reconnect_meta_context)" :
+            (ar != g_state.autoreconnect) ? " (adjusted)" : "");
     }
     if (g_state.has_tcp_syncnt) {
         nfs_set_tcp_syncnt(ctx, g_state.tcp_syncnt);
