@@ -1142,11 +1142,44 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
         syslog(LOG_WARNING, "%s on %s %s — reconnecting",
                reason, op, path ? path : "");
 
-    new_ctx = mount_new_context(g_state.url_effective);
+    /*
+     * Retry mount up to 5 times with 2-second delays.  With
+     * autoreconnect=0 (required for NFSv4 session change detection),
+     * libnfs no longer has built-in TCP reconnect retries.  A brief
+     * network blip can cause mount_new_context to fail on the first
+     * attempt while the server is still recovering.  Without retries,
+     * every transient hiccup becomes a full operation failure and PVE
+     * marks the storage as unavailable.
+     */
+    {
+        int mount_attempts;
+        int max_mount_attempts = 5;
+        new_ctx = NULL;
+        for (mount_attempts = 0; mount_attempts < max_mount_attempts;
+             mount_attempts++) {
+            if (g_state.dead_triggered)
+                break;
+            new_ctx = mount_new_context(g_state.url_effective);
+            if (new_ctx != NULL)
+                break;
+            if (mount_attempts < max_mount_attempts - 1) {
+                DBG(1, "nfsfuse: reconnect: mount attempt %d/%d failed, "
+                       "retrying in 2s\n",
+                    mount_attempts + 1, max_mount_attempts);
+                if (g_log_errors)
+                    syslog(LOG_WARNING,
+                           "reconnect mount attempt %d/%d failed, "
+                           "retrying", mount_attempts + 1,
+                           max_mount_attempts);
+                sleep(2);
+            }
+        }
+    }
     if (new_ctx == NULL) {
-        DBG(1, "nfsfuse: reconnect failed\n");
+        DBG(1, "nfsfuse: reconnect failed after %d attempts\n", 5);
         if (g_log_errors)
-            syslog(LOG_ERR, "reconnect failed after %s on %s %s",
+            syslog(LOG_ERR, "reconnect failed after %s on %s %s "
+                   "(5 mount attempts)",
                    reason, op, path ? path : "");
         return -1;
     }
