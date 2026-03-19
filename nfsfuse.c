@@ -3256,6 +3256,86 @@ static void *nfuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
     }
 
     /*
+     * Post-mount sanity check: verify the NFS mount is healthy by
+     * testing stat and statvfs, then log the result to syslog.
+     */
+    {
+        struct nfs_stat_64 check_st;
+        struct statvfs check_vfs;
+        int check_ok = 1;
+        int stat_rc, vfs_rc;
+        const char *mount_url = g_state.url_effective ? g_state.url_effective
+                                                      : "(unknown)";
+
+        /* Test 1: stat the root directory */
+        pthread_mutex_lock(&g_state.meta_lock);
+        stat_rc = g_state.meta_nfs
+                  ? nfs_lstat64(g_state.meta_nfs, "/", &check_st) : -EIO;
+        pthread_mutex_unlock(&g_state.meta_lock);
+
+        if (stat_rc < 0) {
+            DBG(1, "nfsfuse: SANITY CHECK FAILED: stat / returned %d\n",
+                stat_rc);
+            check_ok = 0;
+        } else if (check_st.nfs_mode == 0 || check_st.nfs_mode > 0777777) {
+            DBG(1, "nfsfuse: SANITY CHECK FAILED: stat / returned "
+                   "garbage mode=%lu\n", (unsigned long)check_st.nfs_mode);
+            check_ok = 0;
+        }
+
+        /* Test 2: statvfs — verify filesystem sizes are sane */
+        pthread_mutex_lock(&g_state.meta_lock);
+        vfs_rc = g_state.meta_nfs
+                 ? nfs_statvfs(g_state.meta_nfs, "/", &check_vfs) : -EIO;
+        pthread_mutex_unlock(&g_state.meta_lock);
+
+        if (vfs_rc < 0) {
+            DBG(1, "nfsfuse: SANITY CHECK FAILED: statvfs returned %d\n",
+                vfs_rc);
+            check_ok = 0;
+        } else if (check_vfs.f_bsize == 0) {
+            DBG(1, "nfsfuse: SANITY CHECK FAILED: statvfs f_bsize=0\n");
+            check_ok = 0;
+        }
+
+        /* Log mount result to syslog */
+        if (g_log_errors || g_syslog_open) {
+            if (check_ok) {
+                syslog(LOG_NOTICE,
+                       "mount OK: %s on %s (nfsv%s%s) — "
+                       "root mode=%o, fs %llu/%llu blocks, bsize=%lu",
+                       mount_url, g_mountpoint,
+                       g_state.safe_v4_mode ? "4" : "3",
+                       g_state.max_mode ? ", max" : "",
+                       (unsigned int)(check_st.nfs_mode & 07777),
+                       (unsigned long long)check_vfs.f_bavail,
+                       (unsigned long long)check_vfs.f_blocks,
+                       (unsigned long)check_vfs.f_bsize);
+            } else {
+                syslog(LOG_ERR,
+                       "mount FAILED sanity check: %s on %s — "
+                       "stat_rc=%d vfs_rc=%d",
+                       mount_url, g_mountpoint, stat_rc, vfs_rc);
+            }
+        }
+
+        DBG(1, "nfsfuse: post-mount sanity check: %s\n",
+            check_ok ? "PASSED" : "FAILED");
+
+        if (check_ok && vfs_rc == 0) {
+            unsigned long long total_gb =
+                (unsigned long long)check_vfs.f_blocks *
+                check_vfs.f_bsize / (1024ULL * 1024 * 1024);
+            unsigned long long avail_gb =
+                (unsigned long long)check_vfs.f_bavail *
+                check_vfs.f_bsize / (1024ULL * 1024 * 1024);
+            DBG(1, "nfsfuse: filesystem: %lluGB total, %lluGB available, "
+                   "bsize=%lu\n", total_gb, avail_gb,
+                (unsigned long)check_vfs.f_bsize);
+        }
+    }
+
+    /*
      * Do NOT use NFS server inode numbers — some NFS servers return
      * duplicate st_ino for different directories after reconnect or
      * across different NFS4 sessions. This causes 'find' and other
@@ -3926,13 +4006,26 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    fprintf(stderr, "nfsfuse %s (build %s, %s): %s mounted on %s (nfsv%s%s%s)\n",
+    fprintf(stderr, "nfsfuse %s (build %s, %s): %s mounted on %s (nfsv%s%s%s%s)\n",
             NFSFUSE_VERSION, NFSFUSE_BUILD, NFSFUSE_BUILD_DATE,
             g_state.fsname ? g_state.fsname : argv[url_idx],
             argv[mount_idx],
             g_state.safe_v4_mode ? "4" : "3",
             g_state.max_mode ? ", max" : "",
-            g_writeback_cache ? ", writeback" : "");
+            g_writeback_cache ? ", writeback" : "",
+            g_async_mode ? ", async" : "");
+
+    /* Log mount to syslog so mount events are tracked */
+    if (g_log_errors || g_syslog_open)
+        syslog(LOG_NOTICE,
+               "mounting %s on %s (nfsv%s%s%s, timeout=%dms retrans=%d)",
+               g_state.fsname ? g_state.fsname : argv[url_idx],
+               argv[mount_idx],
+               g_state.safe_v4_mode ? "4" : "3",
+               g_state.max_mode ? ", max" : "",
+               g_async_mode ? ", async" : "",
+               g_state.has_timeout ? g_state.timeout : 10000,
+               g_state.has_retrans ? g_state.retrans : 0);
 
     if (g_debug) {
         DBG(1, "nfsfuse: starting fuse (argc=%d)\n", fuse_argc);
