@@ -649,7 +649,10 @@ static int async_nfs_statvfs(struct nfs_context *ctx, const char *path,
                        reconnect_reason(rc), (op),                       \
                        (path) ? (path) : "",                             \
                        _retries, g_nfs4_retry_max);                      \
-            sleep(g_nfs4_retry_wait);                                    \
+            if (g_async_mode)
+                usleep(500000);  /* 0.5s — don't block FUSE thread */
+            else
+                sleep(g_nfs4_retry_wait);                                    \
         }                                                                \
     }                                                                    \
 } while (0)
@@ -1098,7 +1101,10 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
                        reconnect_reason(rc), (op),                       \
                        (path) ? (path) : "",                             \
                        _retries, g_nfs4_retry_max);                      \
-            sleep(g_nfs4_retry_wait);                                    \
+            if (g_async_mode)
+                usleep(500000);  /* 0.5s — don't block FUSE thread */
+            else
+                sleep(g_nfs4_retry_wait);                                    \
         }                                                                \
     }                                                                    \
 } while (0)
@@ -1141,7 +1147,10 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
                        reconnect_reason(rc), (op),                       \
                        (path) ? (path) : "",                             \
                        _retries, g_nfs4_retry_max);                        \
-            sleep(g_nfs4_retry_wait);                                  \
+            if (g_async_mode)
+                usleep(500000);  /* 0.5s — don't block FUSE thread */
+            else
+                sleep(g_nfs4_retry_wait);                                  \
         }                                                                \
     }                                                                    \
 } while (0)
@@ -2018,7 +2027,10 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
                        io_retries, g_nfs4_retry_max,
                        reconnect_reason(rc));
             file_handle_unlock(h);
-            sleep(g_nfs4_retry_wait);
+            if (g_async_mode)
+                usleep(500000);  /* 0.5s — don't block FUSE thread */
+            else
+                sleep(g_nfs4_retry_wait);
             file_handle_lock(h);
         }
 
@@ -2104,7 +2116,10 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
                        io_retries, g_nfs4_retry_max,
                        reconnect_reason(rc));
             file_handle_unlock(h);
-            sleep(g_nfs4_retry_wait);
+            if (g_async_mode)
+                usleep(500000);  /* 0.5s — don't block FUSE thread */
+            else
+                sleep(g_nfs4_retry_wait);
             file_handle_lock(h);
         }
 
@@ -2438,6 +2453,9 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
             } else {
                 DBG(1, "nfsfuse: open %s — waiting %ds (retry %d/%d)\n",
                     path ? path : "", g_nfs4_retry_wait, retries, g_nfs4_retry_max);
+                if (g_async_mode)
+                usleep(500000);  /* 0.5s — don't block FUSE thread */
+            else
                 sleep(g_nfs4_retry_wait);
             }
         }
@@ -2526,6 +2544,9 @@ static int nfuse_create(const char *path, mode_t mode, struct fuse_file_info *fi
             } else {
                 DBG(1, "nfsfuse: create %s — waiting %ds (retry %d/%d)\n",
                     path ? path : "", g_nfs4_retry_wait, retries, g_nfs4_retry_max);
+                if (g_async_mode)
+                usleep(500000);  /* 0.5s — don't block FUSE thread */
+            else
                 sleep(g_nfs4_retry_wait);
             }
         }
