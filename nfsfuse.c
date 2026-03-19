@@ -517,8 +517,11 @@ static int async_nfs_open(struct nfs_context *ctx, const char *path,
         ar->abandoned = 1;  /* callback may fire later — don't free */
         return rc;
     }
-    if (ar->err < 0)
-        return ar->err;
+    if (ar->err < 0) {
+        rc = ar->err;
+        free(ar);
+        return rc;
+    }
     if (fh_out)
         *fh_out = (struct nfsfh *)ar->data;
     free(ar);
@@ -547,8 +550,11 @@ static int async_nfs_creat(struct nfs_context *ctx, const char *path,
         ar->abandoned = 1;  /* callback may fire later — don't free */
         return rc;
     }
-    if (ar->err < 0)
-        return ar->err;
+    if (ar->err < 0) {
+        rc = ar->err;
+        free(ar);
+        return rc;
+    }
     if (fh_out)
         *fh_out = (struct nfsfh *)ar->data;
     free(ar);
@@ -697,6 +703,8 @@ static int async_nfs_fstat64(struct nfs_context *ctx, struct nfsfh *fh,
         free(ar);
         return rc;
     }
+    /* Data already copied by callback via copy_dst */
+    free(ar);
     return 0;
 }
 
@@ -831,21 +839,43 @@ static void deferred_close_add(const char *path, struct nfs_context *ctx,
 static void deferred_close_release(const char *path)
 {
     int i;
+    struct nfs_context *close_ctx = NULL;
+    struct nfsfh *close_fh = NULL;
 
     if (path == NULL)
         return;
 
+    /*
+     * Extract the handle from the pool under g_deferred_lock, then
+     * close it under only meta_lock.  Never hold both locks during
+     * a blocking NFS call — that freezes ALL deferred operations
+     * AND all FUSE operations simultaneously.
+     */
     pthread_mutex_lock(&g_deferred_lock);
     for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
         if (g_deferred[i].active && strcmp(g_deferred[i].path, path) == 0) {
             DBG(2, "nfsfuse: deferred close release %s\n", path);
-            pthread_mutex_lock(&g_state.meta_lock);
-            nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
-            pthread_mutex_unlock(&g_state.meta_lock);
+            close_ctx = g_deferred[i].ctx;
+            close_fh = g_deferred[i].fh;
             g_deferred[i].active = 0;
+            break;
         }
     }
     pthread_mutex_unlock(&g_deferred_lock);
+
+    if (close_fh) {
+        if (g_async_mode) {
+            /* Async mode: abandon — server reclaims on lease expiry */
+            DBG(2, "nfsfuse: deferred close: abandoning released "
+                   "handle %s (async mode)\n", path);
+        } else if (pthread_mutex_trylock(&g_state.meta_lock) == 0) {
+            nfs_close(close_ctx, close_fh);
+            pthread_mutex_unlock(&g_state.meta_lock);
+        } else {
+            DBG(1, "nfsfuse: deferred close release: meta_lock busy, "
+                   "abandoning handle %s\n", path);
+        }
+    }
 }
 
 static void deferred_close_expire(void)
@@ -882,10 +912,18 @@ static void deferred_close_all(void)
 {
     int i;
 
+    /*
+     * Called during unmount/cleanup.  Just abandon all handles —
+     * don't attempt nfs_close() which could block for the full NFS
+     * timeout on a dead server (64 handles × timeout = minutes).
+     * The server reclaims resources when the TCP connection drops
+     * or the NFS4 lease expires.
+     */
     pthread_mutex_lock(&g_deferred_lock);
     for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
         if (g_deferred[i].active) {
-            nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
+            DBG(2, "nfsfuse: deferred close shutdown: abandoning %s\n",
+                g_deferred[i].path);
             g_deferred[i].active = 0;
         }
     }
@@ -895,21 +933,33 @@ static void deferred_close_all(void)
 static int deferred_close_fstat(const char *path, struct nfs_stat_64 *st)
 {
     int i, found = 0;
+    struct nfs_context *fstat_ctx = NULL;
+    struct nfsfh *fstat_fh = NULL;
 
     if (path == NULL)
         return 0;
 
+    /*
+     * Extract ctx/fh under g_deferred_lock, then fstat under only
+     * meta_lock.  Never hold both locks during a blocking NFS call.
+     * The entry stays active in the pool (we only peeked).
+     */
     pthread_mutex_lock(&g_deferred_lock);
     for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
         if (g_deferred[i].active && strcmp(g_deferred[i].path, path) == 0) {
-            pthread_mutex_lock(&g_state.meta_lock);
-            if (nfs_fstat64(g_deferred[i].ctx, g_deferred[i].fh, st) == 0)
-                found = 1;
-            pthread_mutex_unlock(&g_state.meta_lock);
+            fstat_ctx = g_deferred[i].ctx;
+            fstat_fh = g_deferred[i].fh;
             break;
         }
     }
     pthread_mutex_unlock(&g_deferred_lock);
+
+    if (fstat_fh) {
+        pthread_mutex_lock(&g_state.meta_lock);
+        if (nfs_fstat64(fstat_ctx, fstat_fh, st) == 0)
+            found = 1;
+        pthread_mutex_unlock(&g_state.meta_lock);
+    }
 
     return found;
 }
@@ -2069,17 +2119,31 @@ static int open_file_handle_common(const char *path, int flags, mode_t mode,
         ctx = g_state.meta_nfs;
     }
 
+    if (g_state.dead_triggered)
+        return -EIO;
+
     if (use_private_ctx) {
         if (create)
             rc = nfs_creat(ctx, path, mode, &fh);
         else
             rc = nfs_open(ctx, path, flags, &fh);
+    } else if (g_async_mode) {
+        /* Use async open/creat to avoid holding meta_lock for the
+         * full NFS timeout on a dead server. */
+        if (create)
+            rc = async_nfs_creat(ctx, path, mode, &fh);
+        else
+            rc = async_nfs_open(ctx, path, flags, &fh);
     } else {
         pthread_mutex_lock(&g_state.meta_lock);
+        if (g_state.has_dead_timeout)
+            g_state.nfs_call_start = time(NULL);
         if (create)
             rc = nfs_creat(ctx, path, mode, &fh);
         else
             rc = nfs_open(ctx, path, flags, &fh);
+        if (g_state.has_dead_timeout)
+            g_state.nfs_call_start = 0;
         pthread_mutex_unlock(&g_state.meta_lock);
     }
 
@@ -2882,8 +2946,17 @@ static int nfuse_release(const char *path, struct fuse_file_info *fi)
             path ? path : "", (void *)h->open_ctx,
             (void *)g_state.meta_nfs);
 
-    if (h->writable && !handle_stale)
-        nfs_fsync(file_handle_ctx(h), h->fh);
+    if (h->writable && !handle_stale && !g_state.dead_triggered) {
+        if (g_async_mode && !h->own_ctx) {
+            /* Use async fsync to avoid holding meta_lock for the
+             * full NFS timeout on a dead server. */
+            file_handle_unlock(h);
+            async_nfs_fsync(file_handle_ctx(h), h->fh);
+            file_handle_lock(h);
+        } else {
+            nfs_fsync(file_handle_ctx(h), h->fh);
+        }
+    }
 
     /*
      * Deferred close for NFS4: keep the file handle open to maintain
@@ -2901,8 +2974,15 @@ static int nfuse_release(const char *path, struct fuse_file_info *fi)
         deferred_close_add(path, file_handle_ctx(h), h->fh);
         /* Don't close the NFS handle — it's now owned by deferred pool */
     } else {
-        if (!handle_stale)
-            nfs_close(file_handle_ctx(h), h->fh);
+        if (!handle_stale && !g_state.dead_triggered) {
+            if (g_async_mode && !h->own_ctx) {
+                file_handle_unlock(h);
+                async_nfs_close(file_handle_ctx(h), h->fh);
+                file_handle_lock(h);
+            } else {
+                nfs_close(file_handle_ctx(h), h->fh);
+            }
+        }
         file_handle_unlock(h);
         if (h->own_ctx)
             destroy_nfs_context_safe(h->ctx);
@@ -3304,11 +3384,22 @@ static int nfuse_flush(const char *path, struct fuse_file_info *fi)
         return 0;
     }
 
+    if (g_state.dead_triggered)
+        return -EIO;
+
     DBG(2, "nfsfuse: flush (fsync) %s\n", path ? path : "(null)");
 
-    file_handle_lock(h);
-    rc = nfs_fsync(file_handle_ctx(h), h->fh);
-    file_handle_unlock(h);
+    if (g_async_mode && !h->own_ctx) {
+        rc = async_nfs_fsync(file_handle_ctx(h), h->fh);
+    } else {
+        file_handle_lock(h);
+        if (g_state.has_dead_timeout)
+            g_state.nfs_call_start = time(NULL);
+        rc = nfs_fsync(file_handle_ctx(h), h->fh);
+        if (g_state.has_dead_timeout)
+            g_state.nfs_call_start = 0;
+        file_handle_unlock(h);
+    }
 
     if (rc < 0)
         return nfs_err_log(rc, "flush/fsync", path, file_handle_ctx(h));
@@ -3338,9 +3429,20 @@ static int nfuse_fsync(const char *path, int datasync, struct fuse_file_info *fi
         return 0;
     }
 
-    file_handle_lock(h);
-    rc = nfs_fsync(file_handle_ctx(h), h->fh);
-    file_handle_unlock(h);
+    if (g_state.dead_triggered)
+        return -EIO;
+
+    if (g_async_mode && !h->own_ctx) {
+        rc = async_nfs_fsync(file_handle_ctx(h), h->fh);
+    } else {
+        file_handle_lock(h);
+        if (g_state.has_dead_timeout)
+            g_state.nfs_call_start = time(NULL);
+        rc = nfs_fsync(file_handle_ctx(h), h->fh);
+        if (g_state.has_dead_timeout)
+            g_state.nfs_call_start = 0;
+        file_handle_unlock(h);
+    }
 
     if (rc < 0)
         return nfs_err_log(rc, "fsync", path, file_handle_ctx(h));
