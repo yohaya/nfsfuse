@@ -193,7 +193,7 @@ struct app_state {
     /* Dead-server watchdog: unmount after N seconds of consecutive failures */
     int dead_timeout;        /* 0 = disabled */
     int has_dead_timeout;
-    time_t first_failure;    /* monotonic time of first consecutive failure, 0 = healthy */
+    long long first_failure_ms;  /* millisecond time of first consecutive failure, 0 = healthy */
     int dead_triggered;      /* 1 = already triggered unmount */
 
     /* Stuck-call recovery: shut down socket after N seconds of meta_lock busy */
@@ -840,17 +840,24 @@ static int g_nfs4_retry_wait = 30;
  */
 static struct fuse *g_fuse_instance;  /* set in nfuse_init */
 
+static long long now_ms(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
 static void dead_timeout_on_failure(void)
 {
-    time_t now;
+    long long now;
 
     if (g_state.dead_timeout <= 0 || g_state.dead_triggered)
         return;
 
-    now = time(NULL);
+    now = now_ms();
 
-    if (g_state.first_failure == 0) {
-        g_state.first_failure = now;
+    if (g_state.first_failure_ms == 0) {
+        g_state.first_failure_ms = now;
         DBG(1, "nfsfuse: dead-timeout watchdog started (limit %ds)\n",
             g_state.dead_timeout);
         if (g_log_errors)
@@ -860,14 +867,15 @@ static void dead_timeout_on_failure(void)
         return;
     }
 
-    if (now - g_state.first_failure >= g_state.dead_timeout) {
+    if ((now - g_state.first_failure_ms) >= (long long)g_state.dead_timeout * 1000) {
         g_state.dead_triggered = 1;
-        DBG(1, "nfsfuse: dead-timeout reached (%ds) — triggering unmount\n",
-            g_state.dead_timeout);
+        long long elapsed_ms = now - g_state.first_failure_ms;
+        DBG(1, "nfsfuse: dead-timeout reached (%lld.%03llds) — triggering unmount\n",
+            elapsed_ms / 1000, elapsed_ms % 1000);
         if (g_log_errors)
             syslog(LOG_CRIT,
-                   "server unreachable for %ld seconds — unmounting",
-                   (long)(now - g_state.first_failure));
+                   "server unreachable for %lld.%03lld seconds — unmounting",
+                   elapsed_ms / 1000, elapsed_ms % 1000);
         if (g_fuse_instance)
             fuse_exit(g_fuse_instance);
     }
@@ -880,13 +888,15 @@ static void dead_timeout_on_success(void)
 
     g_state.last_nfs_success = time(NULL);
 
-    if (g_state.first_failure != 0) {
-        DBG(1, "nfsfuse: dead-timeout watchdog reset — server responded\n");
+    if (g_state.first_failure_ms != 0) {
+        long long elapsed_ms = now_ms() - g_state.first_failure_ms;
+        DBG(1, "nfsfuse: dead-timeout watchdog reset — server responded "
+               "after %lld.%03llds\n", elapsed_ms / 1000, elapsed_ms % 1000);
         if (g_log_errors)
-            syslog(LOG_NOTICE, "connectivity restored after %ld seconds",
-                   (long)(time(NULL) - g_state.first_failure));
+            syslog(LOG_NOTICE, "connectivity restored after %lld.%03lld seconds",
+                   elapsed_ms / 1000, elapsed_ms % 1000);
     }
-    g_state.first_failure = 0;
+    g_state.first_failure_ms = 0;
 }
 
 static int classify_nfs_error(int rc)
@@ -1355,7 +1365,7 @@ static void *keepalive_thread_func(void *arg)
          * (10 * 0.5s) so the watchdog can advance the counter faster.
          */
         int cycles = (g_state.meta_lock_busy_since != 0 ||
-                      (g_state.has_dead_timeout && g_state.first_failure != 0))
+                      (g_state.has_dead_timeout && g_state.first_failure_ms != 0))
                      ? 10 : 60;
         int i;
         for (i = 0; i < cycles && g_state.keepalive_running; i++)
@@ -1366,14 +1376,14 @@ static void *keepalive_thread_func(void *arg)
 
         /* Log dead-timeout watchdog status at level 3 */
         if (g_state.has_dead_timeout) {
-            time_t now = time(NULL);
-            long elapsed = g_state.first_failure
-                           ? (long)(now - g_state.first_failure) : 0;
+            long long elapsed_ms = g_state.first_failure_ms
+                                   ? (now_ms() - g_state.first_failure_ms) : 0;
             DBG(3, "nfsfuse: watchdog tick: dead_timeout=%ds "
-                   "first_failure=%ld elapsed=%lds dead_triggered=%d "
+                   "elapsed=%lld.%03llds dead_triggered=%d "
                    "cycle=%ds\n",
-                g_state.dead_timeout, (long)g_state.first_failure,
-                elapsed, g_state.dead_triggered, cycles / 2);
+                g_state.dead_timeout,
+                elapsed_ms / 1000, elapsed_ms % 1000,
+                g_state.dead_triggered, cycles / 2);
         }
 
         /*
