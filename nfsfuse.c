@@ -2508,31 +2508,43 @@ static int nfuse_getattr(const char *path, struct stat *stbuf, struct fuse_file_
 
     DBG(2, "nfsfuse: getattr %s\n", path ? path : "(null)");
 
-    if (fi && fi->fh) {
-        struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
+    {
+        int did_fstat = 0;
 
-        file_handle_lock(h);
-        rc = nfs_fstat64(file_handle_ctx(h), h->fh, &st);
-        file_handle_unlock(h);
-    } else {
-        if (path == NULL)
-            return -EINVAL;
+        if (fi && fi->fh) {
+            struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
 
-        META_RETRY_ASYNC(rc, "getattr", path,
-            nfs_lstat64(g_state.meta_nfs, path, &st),
-            async_nfs_lstat64(g_state.meta_nfs, path, &st));
+            /* Skip stale handle — dead stateid would timeout or BADSTATEID.
+             * Fall through to path-based stat instead. */
+            if (h->own_ctx || h->open_ctx == g_state.meta_nfs) {
+                file_handle_lock(h);
+                rc = nfs_fstat64(file_handle_ctx(h), h->fh, &st);
+                file_handle_unlock(h);
+                did_fstat = 1;
+            } else {
+                DBG(1, "nfsfuse: getattr %s: stale handle, using "
+                       "path-based stat\n", path ? path : "");
+            }
+        }
 
-        /*
-         * If the NFS server returns NOENT but we have a deferred-close
-         * handle for this path, the file still exists — use fstat on
-         * the held-open handle instead.  This covers the case where the
-         * server evicts the file from its name cache after CLOSE but
-         * the file is still accessible via the open stateid.
-         */
-        if (rc == -ENOENT && deferred_close_fstat(path, &st)) {
-            DBG(1, "nfsfuse: getattr %s recovered via deferred handle\n",
-                path);
-            rc = 0;
+        if (!did_fstat) {
+            if (path == NULL)
+                return -EINVAL;
+
+            META_RETRY_ASYNC(rc, "getattr", path,
+                nfs_lstat64(g_state.meta_nfs, path, &st),
+                async_nfs_lstat64(g_state.meta_nfs, path, &st));
+
+            /*
+             * If the NFS server returns NOENT but we have a deferred-close
+             * handle for this path, the file still exists — use fstat on
+             * the held-open handle instead.
+             */
+            if (rc == -ENOENT && deferred_close_fstat(path, &st)) {
+                DBG(1, "nfsfuse: getattr %s recovered via deferred handle\n",
+                    path);
+                rc = 0;
+            }
         }
     }
 
@@ -2948,18 +2960,27 @@ static int nfuse_truncate(const char *path, off_t size, struct fuse_file_info *f
     DBG(3, "nfsfuse: truncate %s size=%lld\n",
         path ? path : "(null)", (long long)size);
 
-    if (fi && fi->fh) {
-        struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
+    {
+        int did_ftrunc = 0;
 
-        file_handle_lock(h);
-        rc = nfs_ftruncate(file_handle_ctx(h), h->fh, (uint64_t)size);
-        file_handle_unlock(h);
-    } else {
-        if (path == NULL)
-            return -EINVAL;
+        if (fi && fi->fh) {
+            struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
 
-        META_RETRY(rc, "truncate", path,
-            nfs_truncate(g_state.meta_nfs, path, (uint64_t)size));
+            if (h->own_ctx || h->open_ctx == g_state.meta_nfs) {
+                file_handle_lock(h);
+                rc = nfs_ftruncate(file_handle_ctx(h), h->fh, (uint64_t)size);
+                file_handle_unlock(h);
+                did_ftrunc = 1;
+            }
+        }
+
+        if (!did_ftrunc) {
+            if (path == NULL)
+                return -EINVAL;
+
+            META_RETRY(rc, "truncate", path,
+                nfs_truncate(g_state.meta_nfs, path, (uint64_t)size));
+        }
     }
 
     if (rc < 0)
@@ -3162,18 +3183,27 @@ static int nfuse_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
     DBG(2, "nfsfuse: chmod %s\n", path ? path : "(null)");
     DBG(3, "nfsfuse: chmod %s mode=%o\n", path ? path : "(null)", (int)mode);
 
-    if (fi && fi->fh) {
-        struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
+    {
+        int did_fchmod = 0;
 
-        file_handle_lock(h);
-        rc = nfs_fchmod(file_handle_ctx(h), h->fh, mode);
-        file_handle_unlock(h);
-    } else {
-        if (path == NULL)
-            return -EINVAL;
+        if (fi && fi->fh) {
+            struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
 
-        META_RETRY(rc, "chmod", path,
-            nfs_chmod(g_state.meta_nfs, path, mode));
+            if (h->own_ctx || h->open_ctx == g_state.meta_nfs) {
+                file_handle_lock(h);
+                rc = nfs_fchmod(file_handle_ctx(h), h->fh, mode);
+                file_handle_unlock(h);
+                did_fchmod = 1;
+            }
+        }
+
+        if (!did_fchmod) {
+            if (path == NULL)
+                return -EINVAL;
+
+            META_RETRY(rc, "chmod", path,
+                nfs_chmod(g_state.meta_nfs, path, mode));
+        }
     }
 
     if (rc < 0)
@@ -3191,18 +3221,27 @@ static int nfuse_chown(const char *path, uid_t uid, gid_t gid,
     DBG(3, "nfsfuse: chown %s uid=%d gid=%d\n",
         path ? path : "(null)", (int)uid, (int)gid);
 
-    if (fi && fi->fh) {
-        struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
+    {
+        int did_fchown = 0;
 
-        file_handle_lock(h);
-        rc = nfs_fchown(file_handle_ctx(h), h->fh, uid, gid);
-        file_handle_unlock(h);
-    } else {
-        if (path == NULL)
-            return -EINVAL;
+        if (fi && fi->fh) {
+            struct file_handle *h = (struct file_handle *)(uintptr_t)fi->fh;
 
-        META_RETRY(rc, "chown", path,
-            nfs_chown(g_state.meta_nfs, path, uid, gid));
+            if (h->own_ctx || h->open_ctx == g_state.meta_nfs) {
+                file_handle_lock(h);
+                rc = nfs_fchown(file_handle_ctx(h), h->fh, uid, gid);
+                file_handle_unlock(h);
+                did_fchown = 1;
+            }
+        }
+
+        if (!did_fchown) {
+            if (path == NULL)
+                return -EINVAL;
+
+            META_RETRY(rc, "chown", path,
+                nfs_chown(g_state.meta_nfs, path, uid, gid));
+        }
     }
 
     if (rc < 0)
@@ -3257,6 +3296,14 @@ static int nfuse_flush(const char *path, struct fuse_file_info *fi)
     if (!h->writable)
         return 0;
 
+    /* Skip fsync on stale handle — dead NFS4 stateid would timeout
+     * or return BADSTATEID, blocking the FUSE thread for nothing. */
+    if (!h->own_ctx && h->open_ctx != g_state.meta_nfs) {
+        DBG(1, "nfsfuse: flush: stale handle %s, skipping fsync\n",
+            path ? path : "");
+        return 0;
+    }
+
     DBG(2, "nfsfuse: flush (fsync) %s\n", path ? path : "(null)");
 
     file_handle_lock(h);
@@ -3283,6 +3330,13 @@ static int nfuse_fsync(const char *path, int datasync, struct fuse_file_info *fi
         return 0;
 
     h = (struct file_handle *)(uintptr_t)fi->fh;
+
+    /* Skip fsync on stale handle — dead NFS4 stateid would timeout */
+    if (!h->own_ctx && h->open_ctx != g_state.meta_nfs) {
+        DBG(1, "nfsfuse: fsync: stale handle %s, skipping\n",
+            path ? path : "");
+        return 0;
+    }
 
     file_handle_lock(h);
     rc = nfs_fsync(file_handle_ctx(h), h->fh);
