@@ -1642,18 +1642,54 @@ static void *keepalive_thread_func(void *arg)
                            "mount recovered");
             }
             g_state.meta_lock_busy_since = 0;
-            if (g_state.meta_nfs) {
-                DBG(3, "nfsfuse: watchdog: calling nfs_lstat64...\n");
-                int ka_rc = nfs_lstat64(g_state.meta_nfs, "/", &st);
-                if (ka_rc < 0) {
-                    dead_timeout_on_failure();
-                    DBG(1, "nfsfuse: keepalive failed (rc=%d)\n", ka_rc);
-                } else {
-                    dead_timeout_on_success();
-                    DBG(3, "nfsfuse: watchdog: keepalive OK\n");
+
+            if (g_async_mode) {
+                /*
+                 * Async mode: release meta_lock immediately, then use
+                 * async_nfs_lstat64 which manages its own lock (brief
+                 * hold for nfs_service, released during poll).  This
+                 * prevents the keepalive from blocking the FUSE thread
+                 * for the full NFS timeout on a dead server.
+                 */
+                pthread_mutex_unlock(&g_state.meta_lock);
+                if (g_state.meta_nfs) {
+                    DBG(3, "nfsfuse: watchdog: calling async nfs_lstat64...\n");
+                    if (g_state.has_dead_timeout)
+                        g_state.nfs_call_start = time(NULL);
+                    int ka_rc = async_nfs_lstat64(g_state.meta_nfs, "/", &st);
+                    if (g_state.has_dead_timeout)
+                        g_state.nfs_call_start = 0;
+                    if (ka_rc < 0) {
+                        dead_timeout_on_failure();
+                        DBG(1, "nfsfuse: keepalive failed (rc=%d)\n", ka_rc);
+                    } else {
+                        dead_timeout_on_success();
+                        DBG(3, "nfsfuse: watchdog: keepalive OK\n");
+                    }
                 }
+            } else {
+                /*
+                 * Sync mode: hold meta_lock for the NFS call.  Set
+                 * nfs_call_start so the dead-timeout watchdog can
+                 * detect if this call gets stuck.
+                 */
+                if (g_state.meta_nfs) {
+                    DBG(3, "nfsfuse: watchdog: calling nfs_lstat64...\n");
+                    if (g_state.has_dead_timeout)
+                        g_state.nfs_call_start = time(NULL);
+                    int ka_rc = nfs_lstat64(g_state.meta_nfs, "/", &st);
+                    if (g_state.has_dead_timeout)
+                        g_state.nfs_call_start = 0;
+                    if (ka_rc < 0) {
+                        dead_timeout_on_failure();
+                        DBG(1, "nfsfuse: keepalive failed (rc=%d)\n", ka_rc);
+                    } else {
+                        dead_timeout_on_success();
+                        DBG(3, "nfsfuse: watchdog: keepalive OK\n");
+                    }
+                }
+                pthread_mutex_unlock(&g_state.meta_lock);
             }
-            pthread_mutex_unlock(&g_state.meta_lock);
         } else {
             /* Lock held — another thread is stuck in an NFS call */
             DBG(1, "nfsfuse: watchdog: meta_lock busy, "
@@ -2186,6 +2222,7 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
     while (done < size) {
         size_t chunk = size - done;
         int io_retries = 0;
+        int reopen_count = 0;
 
         if (g_state.max_mode && !g_state.safe_v4_mode && chunk > g_state.io_chunk)
             chunk = g_state.io_chunk;
@@ -2224,10 +2261,14 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
                 }
                 /* Try reactive reopen — the file handle's stateid
                  * may be dead after a reconnect.  Reopen gets a
-                 * fresh stateid and the next read attempt may work. */
+                 * fresh stateid and the next read attempt may work.
+                 * Limit reopens to 2 to prevent infinite loop:
+                 * reconnect → reopen → fail → reconnect → reopen → ... */
                 file_handle_unlock(h);
-                if (try_reopen_after_error(h) == 0) {
-                    DBG(1, "nfsfuse: read: reopened, resetting retries\n");
+                if (reopen_count < 2 && try_reopen_after_error(h) == 0) {
+                    reopen_count++;
+                    DBG(1, "nfsfuse: read: reopened (%d/2), "
+                           "resetting retries\n", reopen_count);
                     file_handle_lock(h);
                     io_retries = 0;
                     continue;  /* retry with fresh handle */
@@ -2235,8 +2276,9 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
                 file_handle_lock(h);
                 if (g_log_errors)
                     syslog(LOG_ERR,
-                           "read failed after %d retries (rc=%d/%s)",
-                           io_retries, rc, strerror(-rc));
+                           "read failed after %d retries, %d reopens "
+                           "(rc=%d/%s)",
+                           io_retries, reopen_count, rc, strerror(-rc));
                 break;
             }
             io_retries++;
@@ -2286,6 +2328,7 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
     while (done < size) {
         size_t chunk = size - done;
         int io_retries = 0;
+        int reopen_count = 0;
 
         if (g_state.max_mode && !g_state.safe_v4_mode && chunk > g_state.io_chunk)
             chunk = g_state.io_chunk;
@@ -2322,9 +2365,12 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
                     file_handle_lock(h);
                     rc = -EIO;
                 }
+                /* Limit reopens to 2 to prevent infinite loop */
                 file_handle_unlock(h);
-                if (try_reopen_after_error(h) == 0) {
-                    DBG(1, "nfsfuse: write: reopened, resetting retries\n");
+                if (reopen_count < 2 && try_reopen_after_error(h) == 0) {
+                    reopen_count++;
+                    DBG(1, "nfsfuse: write: reopened (%d/2), "
+                           "resetting retries\n", reopen_count);
                     file_handle_lock(h);
                     io_retries = 0;
                     continue;
@@ -2332,8 +2378,9 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
                 file_handle_lock(h);
                 if (g_log_errors)
                     syslog(LOG_ERR,
-                           "write failed after %d retries (rc=%d/%s)",
-                           io_retries, rc, strerror(-rc));
+                           "write failed after %d retries, %d reopens "
+                           "(rc=%d/%s)",
+                           io_retries, reopen_count, rc, strerror(-rc));
                 break;
             }
             io_retries++;
@@ -2807,7 +2854,23 @@ static int nfuse_release(const char *path, struct fuse_file_info *fi)
         return 0;
 
     file_handle_lock(h);
-    if (h->writable)
+
+    /*
+     * Skip fsync/close if the handle is stale (NFS context changed
+     * after reconnect).  The old NFS4 stateid is dead — fsync/close
+     * would send a compound with a dead stateid on the new session,
+     * which either times out (blocking FUSE thread) or returns
+     * BADSTATEID.  Just abandon the handle.
+     */
+    int handle_stale = (!h->own_ctx && h->open_ctx != g_state.meta_nfs);
+
+    if (handle_stale)
+        DBG(1, "nfsfuse: release: stale handle %s (open_ctx=%p cur=%p) "
+               "— skipping fsync/close\n",
+            path ? path : "", (void *)h->open_ctx,
+            (void *)g_state.meta_nfs);
+
+    if (h->writable && !handle_stale)
         nfs_fsync(file_handle_ctx(h), h->fh);
 
     /*
@@ -2820,12 +2883,14 @@ static int nfuse_release(const char *path, struct fuse_file_info *fi)
     if (h->borrowed) {
         /* Promoted from deferred pool — pool owns the NFS handle */
         file_handle_unlock(h);
-    } else if (h->writable && !h->own_ctx && g_state.safe_v4_mode && path) {
+    } else if (h->writable && !h->own_ctx && g_state.safe_v4_mode &&
+               path && !handle_stale) {
         file_handle_unlock(h);
         deferred_close_add(path, file_handle_ctx(h), h->fh);
         /* Don't close the NFS handle — it's now owned by deferred pool */
     } else {
-        nfs_close(file_handle_ctx(h), h->fh);
+        if (!handle_stale)
+            nfs_close(file_handle_ctx(h), h->fh);
         file_handle_unlock(h);
         if (h->own_ctx)
             destroy_nfs_context_safe(h->ctx);
