@@ -220,6 +220,9 @@ struct file_handle {
     int own_ctx;
     int writable;
     int borrowed;  /* 1 = NFS handle is owned by deferred pool, don't close */
+    struct nfs_context *open_ctx;  /* context at open time — detect stale handles */
+    char path[4096];               /* path for transparent reopen after reconnect */
+    int open_flags;                /* flags for reopen */
 };
 
 /*
@@ -2049,6 +2052,12 @@ static int open_file_handle_common(const char *path, int flags, mode_t mode,
     h->fh = fh;
     h->own_ctx = use_private_ctx;
     h->writable = create || (flags & (O_WRONLY | O_RDWR));
+    h->open_ctx = ctx;  /* remember which context opened this file */
+    h->open_flags = flags;
+    if (path)
+        snprintf(h->path, sizeof(h->path), "%s", path);
+    else
+        h->path[0] = '\0';
 
     if (pthread_mutex_init(&h->lock, NULL) != 0) {
         if (use_private_ctx)
@@ -2070,10 +2079,58 @@ static int open_file_handle_common(const char *path, int flags, mode_t mode,
     return 0;
 }
 
+/*
+ * Transparent reopen: if the NFS context changed (reconnect happened)
+ * since this file was opened, the NFS4 stateid is dead.  Reopen the
+ * file on the current context to get a fresh stateid.
+ *
+ * Must be called with file_handle_lock held (for shared ctx handles).
+ */
+static int try_reopen_if_stale(struct file_handle *h)
+{
+    struct nfs_context *cur_ctx;
+    struct nfsfh *new_fh = NULL;
+    int rc;
+
+    if (h->own_ctx || h->borrowed || h->path[0] == '\0')
+        return 0;  /* can't reopen private-ctx, borrowed, or pathless handles */
+
+    cur_ctx = g_state.meta_nfs;
+    if (h->open_ctx == cur_ctx)
+        return 0;  /* same context — no reopen needed */
+
+    DBG(1, "nfsfuse: reopen: context changed (open_ctx=%p cur=%p) "
+           "— reopening %s\n",
+        (void *)h->open_ctx, (void *)cur_ctx, h->path);
+
+    if (g_log_errors)
+        syslog(LOG_NOTICE, "transparent reopen %s after reconnect", h->path);
+
+    /* Reopen on current context */
+    rc = nfs_open(cur_ctx, h->path, h->open_flags, &new_fh);
+    if (rc < 0) {
+        DBG(1, "nfsfuse: reopen failed: %s (rc=%d)\n",
+            nfs_get_error(cur_ctx), rc);
+        return rc;
+    }
+
+    /* Don't close old fh — old context is dead, close would block/crash */
+    h->fh = new_fh;
+    h->open_ctx = cur_ctx;
+
+    DBG(1, "nfsfuse: reopen: success, new fh=%p\n", (void *)new_fh);
+    return 0;
+}
+
 static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offset)
 {
     size_t done = 0;
     int rc = 0;
+
+    /* Transparent reopen if session changed */
+    file_handle_lock(h);
+    try_reopen_if_stale(h);
+    file_handle_unlock(h);
 
     file_handle_lock(h);
 
@@ -2163,6 +2220,11 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
 {
     size_t done = 0;
     int rc = 0;
+
+    /* Transparent reopen if session changed */
+    file_handle_lock(h);
+    try_reopen_if_stale(h);
+    file_handle_unlock(h);
 
     file_handle_lock(h);
 
