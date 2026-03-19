@@ -1023,6 +1023,65 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
  *
  * The 'call' expression must use g_state.meta_nfs (updated on reconnect).
  */
+/*
+ * META_RETRY_ASYNC: version that accepts both sync and async call exprs.
+ * In async mode, uses the async_call which manages meta_lock internally
+ * (acquires briefly for nfs_service, releases during poll).
+ * In sync mode, uses the blocking call with meta_lock held throughout.
+ */
+#define META_RETRY_ASYNC(rc, op, path, sync_call, async_call) do {       \
+    int _retries = 0;                                                    \
+    int _did_reconnect = 0;                                              \
+    for (;;) {                                                           \
+        if (g_state.dead_triggered) { (rc) = -EIO; break; }              \
+        if (g_async_mode) {                                              \
+            if (g_state.has_dead_timeout)                                 \
+                g_state.nfs_call_start = time(NULL);                     \
+            (rc) = (async_call);                                         \
+            if (g_state.has_dead_timeout)                                 \
+                g_state.nfs_call_start = 0;                              \
+        } else {                                                         \
+            pthread_mutex_lock(&g_state.meta_lock);                      \
+            if (g_state.has_dead_timeout)                                 \
+                g_state.nfs_call_start = time(NULL);                     \
+            (rc) = (sync_call);                                          \
+            if (g_state.has_dead_timeout)                                 \
+                g_state.nfs_call_start = 0;                              \
+            pthread_mutex_unlock(&g_state.meta_lock);                    \
+        }                                                                \
+        if ((rc) >= 0) {                                                 \
+            dead_timeout_on_success();                                    \
+            if (_retries > 0 && g_log_errors)                            \
+                syslog(LOG_NOTICE, "%s %s recovered after %d retries",   \
+                       (op), (path) ? (path) : "", _retries);            \
+            break;                                                       \
+        }                                                                \
+        dead_timeout_on_failure();                                       \
+        if (g_state.dead_triggered) { (rc) = -EIO; break; }              \
+        int _cls = classify_nfs_error(rc);                               \
+        if (_cls == RETRY_NONE || _retries >= g_nfs4_retry_max)          \
+            break;                                                       \
+        _retries++;                                                      \
+        if (_cls == RETRY_RECONNECT && !_did_reconnect) {                \
+            if (reconnect_meta_context((rc), (op), (path)) == 0)         \
+                _did_reconnect = 1;                                      \
+            else                                                         \
+                break;                                                   \
+        } else {                                                         \
+            DBG(1, "nfsfuse: %s on %s %s — waiting %ds (retry %d/%d)\n", \
+                reconnect_reason(rc), (op), (path) ? (path) : "",        \
+                g_nfs4_retry_wait, _retries, g_nfs4_retry_max);          \
+            if (g_log_errors)                                            \
+                syslog(LOG_WARNING, "%s on %s %s — retry %d/%d",         \
+                       reconnect_reason(rc), (op),                       \
+                       (path) ? (path) : "",                             \
+                       _retries, g_nfs4_retry_max);                      \
+            sleep(g_nfs4_retry_wait);                                    \
+        }                                                                \
+    }                                                                    \
+} while (0)
+
+/* Backward-compatible: sync-only META_RETRY */
 #define META_RETRY(rc, op, path, call) do {                              \
     int _retries = 0;                                                    \
     int _did_reconnect = 0;                                              \
@@ -2147,8 +2206,9 @@ static int nfuse_getattr(const char *path, struct stat *stbuf, struct fuse_file_
         if (path == NULL)
             return -EINVAL;
 
-        META_RETRY(rc, "getattr", path,
-            nfs_lstat64(g_state.meta_nfs, path, &st));
+        META_RETRY_ASYNC(rc, "getattr", path,
+            nfs_lstat64(g_state.meta_nfs, path, &st),
+            async_nfs_lstat64(g_state.meta_nfs, path, &st));
 
         /*
          * If the NFS server returns NOENT but we have a deferred-close
@@ -2908,8 +2968,9 @@ static int nfuse_statfs(const char *path, struct statvfs *st)
 
     memset(st, 0, sizeof(*st));
 
-    META_RETRY(rc, "statfs", "/",
-        nfs_statvfs(g_state.meta_nfs, "/", st));
+    META_RETRY_ASYNC(rc, "statfs", "/",
+        nfs_statvfs(g_state.meta_nfs, "/", st),
+        async_nfs_statvfs(g_state.meta_nfs, "/", st));
 
     if (rc < 0)
         return nfs_err_log(rc, "statfs", "/", g_state.meta_nfs);
