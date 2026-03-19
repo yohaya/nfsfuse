@@ -4015,17 +4015,28 @@ int main(int argc, char *argv[])
             g_writeback_cache ? ", writeback" : "",
             g_async_mode ? ", async" : "");
 
-    /* Log mount to syslog so mount events are tracked */
+    /* Log mount to syslog with all options */
     if (g_log_errors || g_syslog_open)
         syslog(LOG_NOTICE,
-               "mounting %s on %s (nfsv%s%s%s, timeout=%dms retrans=%d)",
+               "mounting %s on %s — nfsv%s%s%s%s "
+               "timeout=%dms retrans=%d autoreconnect=%d "
+               "nfs4_retries=%d nfs4_retry_wait=%ds "
+               "stuck_timeout=%ds dead_timeout=%ds "
+               "reconnect_stale=%d reconnect_io_error=%d%s",
                g_state.fsname ? g_state.fsname : argv[url_idx],
                argv[mount_idx],
                g_state.safe_v4_mode ? "4" : "3",
-               g_state.max_mode ? ", max" : "",
-               g_async_mode ? ", async" : "",
+               g_state.max_mode ? " max" : "",
+               g_async_mode ? " async" : "",
+               g_writeback_cache ? " writeback" : "",
                g_state.has_timeout ? g_state.timeout : 10000,
-               g_state.has_retrans ? g_state.retrans : 0);
+               g_state.has_retrans ? g_state.retrans : 0,
+               g_state.has_autoreconnect ? g_state.autoreconnect : 0,
+               g_nfs4_retry_max, g_nfs4_retry_wait,
+               g_state.stuck_timeout,
+               g_state.has_dead_timeout ? g_state.dead_timeout : 0,
+               g_reconnect_on_stale, g_reconnect_on_io_error,
+               g_auto_remount ? " auto-remount" : "");
 
     if (g_debug) {
         DBG(1, "nfsfuse: starting fuse (argc=%d)\n", fuse_argc);
