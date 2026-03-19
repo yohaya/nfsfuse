@@ -2086,35 +2086,43 @@ static int open_file_handle_common(const char *path, int flags, mode_t mode,
  *
  * Must be called with file_handle_lock held (for shared ctx handles).
  */
-static int try_reopen_if_stale(struct file_handle *h)
+/*
+ * Reactive reopen: called ONLY after a read/write fails with an error
+ * that suggests a stale NFS4 stateid (timeout, ERANGE, EINVAL, EIO).
+ * Does NOT run on every read/write — zero overhead on the normal path.
+ *
+ * Must be called WITHOUT meta_lock held (the nfs_open is sync and
+ * will acquire meta_lock via META_RETRY internally if needed).
+ */
+static int try_reopen_after_error(struct file_handle *h)
 {
     struct nfs_context *cur_ctx;
     struct nfsfh *new_fh = NULL;
     int rc;
 
     if (h->own_ctx || h->borrowed || h->path[0] == '\0')
-        return 0;  /* can't reopen private-ctx, borrowed, or pathless handles */
+        return -1;  /* can't reopen */
 
     cur_ctx = g_state.meta_nfs;
-    if (h->open_ctx == cur_ctx)
-        return 0;  /* same context — no reopen needed */
 
-    DBG(1, "nfsfuse: reopen: context changed (open_ctx=%p cur=%p) "
-           "— reopening %s\n",
-        (void *)h->open_ctx, (void *)cur_ctx, h->path);
+    DBG(1, "nfsfuse: reopen: attempting reopen of %s on ctx=%p "
+           "(was open_ctx=%p)\n",
+        h->path, (void *)cur_ctx, (void *)h->open_ctx);
 
     if (g_log_errors)
-        syslog(LOG_NOTICE, "transparent reopen %s after reconnect", h->path);
+        syslog(LOG_NOTICE, "reopening %s after I/O error", h->path);
 
-    /* Reopen on current context */
+    /* Reopen on current context — sync call, no meta_lock held */
+    pthread_mutex_lock(&g_state.meta_lock);
     rc = nfs_open(cur_ctx, h->path, h->open_flags, &new_fh);
+    pthread_mutex_unlock(&g_state.meta_lock);
+
     if (rc < 0) {
-        DBG(1, "nfsfuse: reopen failed: %s (rc=%d)\n",
-            nfs_get_error(cur_ctx), rc);
+        DBG(1, "nfsfuse: reopen failed: rc=%d\n", rc);
         return rc;
     }
 
-    /* Don't close old fh — old context is dead, close would block/crash */
+    /* Don't close old fh — old context may be dead */
     h->fh = new_fh;
     h->open_ctx = cur_ctx;
 
@@ -2126,11 +2134,6 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
 {
     size_t done = 0;
     int rc = 0;
-
-    /* Transparent reopen if session changed */
-    file_handle_lock(h);
-    try_reopen_if_stale(h);
-    file_handle_unlock(h);
 
     file_handle_lock(h);
 
@@ -2173,6 +2176,17 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
                     file_handle_lock(h);
                     rc = -EIO;
                 }
+                /* Try reactive reopen — the file handle's stateid
+                 * may be dead after a reconnect.  Reopen gets a
+                 * fresh stateid and the next read attempt may work. */
+                file_handle_unlock(h);
+                if (try_reopen_after_error(h) == 0) {
+                    DBG(1, "nfsfuse: read: reopened, resetting retries\n");
+                    file_handle_lock(h);
+                    io_retries = 0;
+                    continue;  /* retry with fresh handle */
+                }
+                file_handle_lock(h);
                 if (g_log_errors)
                     syslog(LOG_ERR,
                            "read failed after %d retries (rc=%d/%s)",
@@ -2221,11 +2235,6 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
     size_t done = 0;
     int rc = 0;
 
-    /* Transparent reopen if session changed */
-    file_handle_lock(h);
-    try_reopen_if_stale(h);
-    file_handle_unlock(h);
-
     file_handle_lock(h);
 
     while (done < size) {
@@ -2267,6 +2276,14 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
                     file_handle_lock(h);
                     rc = -EIO;
                 }
+                file_handle_unlock(h);
+                if (try_reopen_after_error(h) == 0) {
+                    DBG(1, "nfsfuse: write: reopened, resetting retries\n");
+                    file_handle_lock(h);
+                    io_retries = 0;
+                    continue;
+                }
+                file_handle_lock(h);
                 if (g_log_errors)
                     syslog(LOG_ERR,
                            "write failed after %d retries (rc=%d/%s)",
