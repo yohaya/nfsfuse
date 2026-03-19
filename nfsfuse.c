@@ -2132,17 +2132,26 @@ static int try_reopen_after_error(struct file_handle *h)
 
     cur_ctx = g_state.meta_nfs;
 
-    DBG(1, "nfsfuse: reopen: attempting reopen of %s on ctx=%p "
-           "(was open_ctx=%p)\n",
-        h->path, (void *)cur_ctx, (void *)h->open_ctx);
+    /* Only reopen if the context actually changed (reconnect happened).
+     * If same context, the error is not about stale stateids — reopening
+     * would fail with the same error and waste time holding meta_lock. */
+    if (h->open_ctx == cur_ctx) {
+        DBG(1, "nfsfuse: reopen: same context %p — skipping (not a "
+               "stale stateid issue)\n", (void *)cur_ctx);
+        return -1;
+    }
+
+    DBG(1, "nfsfuse: reopen: context changed (open_ctx=%p cur=%p) "
+           "— reopening %s\n",
+        (void *)h->open_ctx, (void *)cur_ctx, h->path);
 
     if (g_log_errors)
-        syslog(LOG_NOTICE, "reopening %s after I/O error", h->path);
+        syslog(LOG_NOTICE, "reopening %s after reconnect "
+               "(old_ctx=%p new_ctx=%p)", h->path,
+               (void *)h->open_ctx, (void *)cur_ctx);
 
-    /* Reopen on current context — sync call, no meta_lock held */
-    pthread_mutex_lock(&g_state.meta_lock);
-    rc = nfs_open(cur_ctx, h->path, h->open_flags, &new_fh);
-    pthread_mutex_unlock(&g_state.meta_lock);
+    /* Use async open to avoid blocking meta_lock */
+    rc = async_nfs_open(cur_ctx, h->path, h->open_flags, &new_fh);
 
     if (rc < 0) {
         DBG(1, "nfsfuse: reopen failed: rc=%d\n", rc);
