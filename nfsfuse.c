@@ -1134,13 +1134,10 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
 {
     struct nfs_context *new_ctx;
     const char *reason = reconnect_reason(rc);
+    long long reconnect_start_ms = now_ms();
 
     DBG(1, "nfsfuse: %s on %s %s — reconnecting\n",
         reason, op, path ? path : "");
-
-    if (g_log_errors)
-        syslog(LOG_WARNING, "%s on %s %s — reconnecting",
-               reason, op, path ? path : "");
 
     /*
      * Retry mount up to 5 times with 2-second delays.  With
@@ -1242,10 +1239,24 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
     }
     pthread_mutex_unlock(&g_state.meta_lock);
 
-    DBG(1, "nfsfuse: reconnected successfully\n");
-    if (g_log_errors)
-        syslog(LOG_NOTICE, "reconnected after %s, retrying %s %s",
-               reason, op, path ? path : "");
+    {
+        long long reconnect_elapsed_ms = now_ms() - reconnect_start_ms;
+        DBG(1, "nfsfuse: reconnected successfully (%lld.%03llds)\n",
+            reconnect_elapsed_ms / 1000, reconnect_elapsed_ms % 1000);
+
+        /*
+         * Only log to syslog if the reconnect took >= 500ms.
+         * Sub-500ms reconnects are transient blips that recovered
+         * instantly — logging them creates syslog noise without
+         * actionable information.
+         */
+        if (g_log_errors && reconnect_elapsed_ms >= 500)
+            syslog(LOG_NOTICE, "reconnected after %s, retrying %s %s "
+                   "(%lld.%03llds)",
+                   reason, op, path ? path : "",
+                   reconnect_elapsed_ms / 1000,
+                   reconnect_elapsed_ms % 1000);
+    }
 
     return 0;
 }
