@@ -138,10 +138,13 @@ libnfs maps multiple NFS4 errors to the same errno values. nfsfuse handles all o
 | ESTALE | ESTALE (-116) | Reconnect + retry (default on) |
 | EIO | EIO (-5) | Reconnect + retry (default on) |
 | ETIMEDOUT | ETIMEDOUT (-110) | Wait + retry |
+| Context changed (async) | EAGAIN (-11) | Immediate retry with new context |
 
-For metadata operations (getattr, open, mkdir, etc.), the `META_RETRY` macro handles reconnect + retry up to `--nfs4-retries` times. For I/O operations (read, write), the retry loop sleeps `--nfs4-retry-wait` seconds between attempts, then reconnects after retries are exhausted.
+For metadata operations (getattr, open, mkdir, etc.), the `META_RETRY` macro handles reconnect + retry up to `--nfs4-retries` times. Up to 3 reconnects are allowed per retry loop — if the server flaps multiple times, nfsfuse reconnects each time rather than giving up after the first. For I/O operations (read, write), the retry loop sleeps `--nfs4-retry-wait` seconds between attempts, then reconnects after retries are exhausted. If a read/write file handle becomes stale after reconnect, it is transparently reopened (up to 5 times per operation). Flush and fsync operations also retry on transient errors.
 
-ERANGE is mapped to EIO before returning to applications, so callers never see "Numerical result out of range."
+For file-handle-based operations (getattr, truncate, chmod, chown), a transient NFS error on the file handle automatically falls through to the path-based retry path, which has full reconnect/recovery logic.
+
+ERANGE and EAGAIN are mapped to EIO before returning to applications, so callers never see "Numerical result out of range" or spurious "Resource temporarily unavailable."
 
 ## Performance mode (`--max`)
 
@@ -196,7 +199,7 @@ Non-retriable errors are logged immediately at `ERR` priority.
 
 NFSv4 uses a deferred close pool (64 slots) that keeps recently closed file handles alive for up to 5 minutes. This prevents the NFS server from reclaiming resources while a file may still be needed (close-to-open consistency).
 
-The pool is **flushed on reconnect** to prevent use-after-free of stale handles from dead sessions. Pool eviction under pressure uses non-blocking trylock to prevent mount freezes during high file turnover.
+The pool is **flushed on reconnect** to prevent use-after-free of stale handles from dead sessions. All pool operations (add, release, expire, fstat, peek) validate that the stored context matches the current NFS session before use — stale entries from dead sessions are abandoned rather than risking a crash. Pool eviction under pressure uses non-blocking trylock to prevent mount freezes during high file turnover.
 
 ## NFSv4 notes
 
@@ -205,6 +208,9 @@ The pool is **flushed on reconnect** to prevent use-after-free of stale handles 
 - Directory caching is disabled for NFSv4 to avoid stale data
 - NFS4 lease keepalive thread sends `getattr("/")` every 30 seconds
 - Autoreconnect is capped to 3 for NFSv4 (prevents silent session state loss)
+- On reconnect, the old NFS context's socket is shut down and closed to free the privileged port — prevents port exhaustion on systems with many reconnects
+- Directory handles use `dir_handle_ctx()` to always reference the current NFS context after reconnect, preventing stale-context crashes
+- Async NFS operations validate the context is still current before submitting requests and free resources immediately if the context was swapped during the operation
 
 ## Supported FUSE operations
 
