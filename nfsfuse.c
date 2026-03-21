@@ -290,8 +290,10 @@ static int nfs_err(int rc)
      * libnfs maps NFS4ERR_EXPIRED/GRACE/STALE_CLIENTID to ERANGE (-34).
      * ERANGE is not a meaningful I/O error for applications — they don't
      * know what "Numerical result out of range" means.  Map it to EIO.
+     * EAGAIN from async context-change detection is also not meaningful
+     * to applications — map it to EIO.
      */
-    if (rc == -ERANGE)
+    if (rc == -ERANGE || rc == -EAGAIN)
         return -EIO;
     return rc;
 }
@@ -470,6 +472,16 @@ static int async_nfs_lstat64(struct nfs_context *ctx, const char *path,
     }
 
     pthread_mutex_lock(&g_state.meta_lock);
+
+    /* Check context is still current before submitting async op.
+     * If a reconnect happened, ctx is dead and the callback would
+     * never fire, permanently leaking ar. */
+    if (ctx != g_state.meta_nfs) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
+        return -EAGAIN;
+    }
+
     rc = nfs_lstat64_async(ctx, path, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
@@ -482,7 +494,12 @@ static int async_nfs_lstat64(struct nfs_context *ctx, const char *path,
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc != 0) {
-        ar->abandoned = 1;
+        /* If ctx is no longer current, the old context's socket is
+         * shut down and callbacks will never fire — free now. */
+        if (ctx != g_state.meta_nfs)
+            free(ar);
+        else
+            ar->abandoned = 1;  /* callback may still fire */
         return rc;
     }
     if (ar->err < 0) {
@@ -504,9 +521,15 @@ static int async_nfs_open(struct nfs_context *ctx, const char *path,
     if (!ar) return -ENOMEM;
 
     pthread_mutex_lock(&g_state.meta_lock);
+    if (ctx != g_state.meta_nfs) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
+        return -EAGAIN;
+    }
     rc = nfs_open_async(ctx, path, flags, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
         return rc;
     }
 
@@ -514,7 +537,10 @@ static int async_nfs_open(struct nfs_context *ctx, const char *path,
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc != 0) {
-        ar->abandoned = 1;  /* callback may fire later — don't free */
+        if (ctx != g_state.meta_nfs)
+            free(ar);
+        else
+            ar->abandoned = 1;
         return rc;
     }
     if (ar->err < 0) {
@@ -537,9 +563,15 @@ static int async_nfs_creat(struct nfs_context *ctx, const char *path,
     if (!ar) return -ENOMEM;
 
     pthread_mutex_lock(&g_state.meta_lock);
+    if (ctx != g_state.meta_nfs) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
+        return -EAGAIN;
+    }
     rc = nfs_creat_async(ctx, path, mode, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
         return rc;
     }
 
@@ -547,7 +579,10 @@ static int async_nfs_creat(struct nfs_context *ctx, const char *path,
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc != 0) {
-        ar->abandoned = 1;  /* callback may fire later — don't free */
+        if (ctx != g_state.meta_nfs)
+            free(ar);
+        else
+            ar->abandoned = 1;
         return rc;
     }
     if (ar->err < 0) {
@@ -569,9 +604,15 @@ static int async_nfs_close(struct nfs_context *ctx, struct nfsfh *fh)
     if (!ar) return -ENOMEM;
 
     pthread_mutex_lock(&g_state.meta_lock);
+    if (ctx != g_state.meta_nfs) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
+        return -EAGAIN;
+    }
     rc = nfs_close_async(ctx, fh, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
         return rc;
     }
 
@@ -579,7 +620,10 @@ static int async_nfs_close(struct nfs_context *ctx, struct nfsfh *fh)
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc != 0) {
-        ar->abandoned = 1;  /* callback may fire later — don't free */
+        if (ctx != g_state.meta_nfs)
+            free(ar);
+        else
+            ar->abandoned = 1;
         return rc;
     }
     rc = ar->err < 0 ? ar->err : 0;
@@ -596,10 +640,16 @@ static int async_nfs_pread(struct nfs_context *ctx, struct nfsfh *fh,
     if (!ar) return -ENOMEM;
 
     pthread_mutex_lock(&g_state.meta_lock);
+    if (ctx != g_state.meta_nfs) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
+        return -EAGAIN;
+    }
     rc = nfs_pread_async(ctx, fh, (void *)buf, (size_t)count,
                          (uint64_t)offset, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
         return rc;
     }
 
@@ -607,7 +657,10 @@ static int async_nfs_pread(struct nfs_context *ctx, struct nfsfh *fh,
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc != 0) {
-        ar->abandoned = 1;  /* callback may fire later — don't free */
+        if (ctx != g_state.meta_nfs)
+            free(ar);
+        else
+            ar->abandoned = 1;
         return rc;
     }
     rc = ar->err;
@@ -624,10 +677,16 @@ static int async_nfs_pwrite(struct nfs_context *ctx, struct nfsfh *fh,
     if (!ar) return -ENOMEM;
 
     pthread_mutex_lock(&g_state.meta_lock);
+    if (ctx != g_state.meta_nfs) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
+        return -EAGAIN;
+    }
     rc = nfs_pwrite_async(ctx, fh, (const void *)buf, (size_t)count,
                           (uint64_t)offset, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
         return rc;
     }
 
@@ -635,7 +694,10 @@ static int async_nfs_pwrite(struct nfs_context *ctx, struct nfsfh *fh,
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc != 0) {
-        ar->abandoned = 1;  /* callback may fire later — don't free */
+        if (ctx != g_state.meta_nfs)
+            free(ar);
+        else
+            ar->abandoned = 1;
         return rc;
     }
     rc = ar->err;
@@ -651,9 +713,15 @@ static int async_nfs_fsync(struct nfs_context *ctx, struct nfsfh *fh)
     if (!ar) return -ENOMEM;
 
     pthread_mutex_lock(&g_state.meta_lock);
+    if (ctx != g_state.meta_nfs) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
+        return -EAGAIN;
+    }
     rc = nfs_fsync_async(ctx, fh, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
         return rc;
     }
 
@@ -661,7 +729,10 @@ static int async_nfs_fsync(struct nfs_context *ctx, struct nfsfh *fh)
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc != 0) {
-        ar->abandoned = 1;  /* callback may fire later — don't free */
+        if (ctx != g_state.meta_nfs)
+            free(ar);
+        else
+            ar->abandoned = 1;
         return rc;
     }
     rc = ar->err < 0 ? ar->err : 0;
@@ -683,9 +754,15 @@ static int async_nfs_fstat64(struct nfs_context *ctx, struct nfsfh *fh,
     }
 
     pthread_mutex_lock(&g_state.meta_lock);
+    if (ctx != g_state.meta_nfs) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
+        return -EAGAIN;
+    }
     rc = nfs_fstat64_async(ctx, fh, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
         return rc;
     }
 
@@ -693,7 +770,10 @@ static int async_nfs_fstat64(struct nfs_context *ctx, struct nfsfh *fh,
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc != 0) {
-        ar->abandoned = 1;
+        if (ctx != g_state.meta_nfs)
+            free(ar);
+        else
+            ar->abandoned = 1;
         return rc;
     }
     if (ar->err < 0) {
@@ -720,9 +800,15 @@ static int async_nfs_statvfs(struct nfs_context *ctx, const char *path,
     }
 
     pthread_mutex_lock(&g_state.meta_lock);
+    if (ctx != g_state.meta_nfs) {
+        pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
+        return -EAGAIN;
+    }
     rc = nfs_statvfs_async(ctx, path, async_generic_cb, ar);
     if (rc != 0) {
         pthread_mutex_unlock(&g_state.meta_lock);
+        free(ar);
         return rc;
     }
 
@@ -730,7 +816,10 @@ static int async_nfs_statvfs(struct nfs_context *ctx, const char *path,
     pthread_mutex_unlock(&g_state.meta_lock);
 
     if (rc != 0) {
-        ar->abandoned = 1;
+        if (ctx != g_state.meta_nfs)
+            free(ar);
+        else
+            ar->abandoned = 1;
         return rc;
     }
     if (ar->err < 0) {
@@ -746,7 +835,7 @@ static int async_nfs_statvfs(struct nfs_context *ctx, const char *path,
 /* --- Async META_RETRY: same retry logic but using async event loop --- */
 #define ASYNC_META_RETRY(rc, op, path, async_call) do {                  \
     int _retries = 0;                                                    \
-    int _did_reconnect = 0;                                              \
+    int _reconnect_count = 0;                                            \
     for (;;) {                                                           \
         if (g_state.dead_triggered) { (rc) = -EIO; break; }              \
         (rc) = (async_call);                                             \
@@ -763,9 +852,9 @@ static int async_nfs_statvfs(struct nfs_context *ctx, const char *path,
         if (_cls == RETRY_NONE || _retries >= g_nfs4_retry_max)          \
             break;                                                       \
         _retries++;                                                      \
-        if (_cls == RETRY_RECONNECT && !_did_reconnect) {                \
+        if (_cls == RETRY_RECONNECT && _reconnect_count < 3) {           \
             if (reconnect_meta_context((rc), (op), (path)) == 0)         \
-                _did_reconnect = 1;                                      \
+                _reconnect_count++;                                      \
             else                                                         \
                 break;                                                   \
         } else {                                                         \
@@ -810,10 +899,15 @@ static void deferred_close_add(const char *path, struct nfs_context *ctx,
 
     if (g_deferred[oldest].active) {
         DBG(2, "nfsfuse: deferred close evict %s\n", g_deferred[oldest].path);
-        if (g_async_mode) {
+        if (g_deferred[oldest].ctx != g_state.meta_nfs) {
+            /* Context is stale — nfs_close on dead ctx would crash */
+            DBG(1, "nfsfuse: deferred close evict: stale ctx, "
+                   "abandoning %s\n", g_deferred[oldest].path);
+        } else if (g_async_mode) {
             /* Async mode: abandon — nfs_close blocks on dead servers */
         } else if (pthread_mutex_trylock(&g_state.meta_lock) == 0) {
-            nfs_close(g_deferred[oldest].ctx, g_deferred[oldest].fh);
+            if (g_deferred[oldest].ctx == g_state.meta_nfs)
+                nfs_close(g_deferred[oldest].ctx, g_deferred[oldest].fh);
             pthread_mutex_unlock(&g_state.meta_lock);
         } else {
             DBG(1, "nfsfuse: deferred close evict: meta_lock busy, "
@@ -862,12 +956,23 @@ static void deferred_close_release(const char *path)
     pthread_mutex_unlock(&g_deferred_lock);
 
     if (close_fh) {
-        if (g_async_mode) {
+        if (close_ctx != g_state.meta_nfs) {
+            /* Context is stale (reconnect happened) — the fh belongs
+             * to a dead session.  Calling nfs_close on it would use
+             * a dead context and could crash.  Abandon the handle. */
+            DBG(1, "nfsfuse: deferred close release: stale ctx, "
+                   "abandoning handle %s\n", path);
+        } else if (g_async_mode) {
             /* Async mode: abandon — server reclaims on lease expiry */
             DBG(2, "nfsfuse: deferred close: abandoning released "
                    "handle %s (async mode)\n", path);
         } else if (pthread_mutex_trylock(&g_state.meta_lock) == 0) {
-            nfs_close(close_ctx, close_fh);
+            /* Re-check ctx under lock — reconnect could have raced */
+            if (close_ctx == g_state.meta_nfs)
+                nfs_close(close_ctx, close_fh);
+            else
+                DBG(1, "nfsfuse: deferred close release: ctx stale "
+                       "after lock, abandoning %s\n", path);
             pthread_mutex_unlock(&g_state.meta_lock);
         } else {
             DBG(1, "nfsfuse: deferred close release: meta_lock busy, "
@@ -886,7 +991,12 @@ static void deferred_close_expire(void)
         if (g_deferred[i].active &&
             (now - g_deferred[i].created) >= DEFERRED_CLOSE_SEC) {
             DBG(2, "nfsfuse: deferred close expire %s\n", g_deferred[i].path);
-            if (g_async_mode) {
+            if (g_deferred[i].ctx != g_state.meta_nfs) {
+                /* Context is stale — nfs_close on dead ctx would crash */
+                DBG(1, "nfsfuse: deferred close expire: stale ctx, "
+                       "abandoning %s\n", g_deferred[i].path);
+                g_deferred[i].active = 0;
+            } else if (g_async_mode) {
                 /* In async mode, just abandon the handle — don't risk
                  * a blocking nfs_close() that freezes the mount.
                  * The NFS server will reclaim it on lease expiry. */
@@ -894,7 +1004,11 @@ static void deferred_close_expire(void)
                        "handle %s (async mode)\n", g_deferred[i].path);
                 g_deferred[i].active = 0;
             } else if (pthread_mutex_trylock(&g_state.meta_lock) == 0) {
-                nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
+                if (g_deferred[i].ctx == g_state.meta_nfs)
+                    nfs_close(g_deferred[i].ctx, g_deferred[i].fh);
+                else
+                    DBG(1, "nfsfuse: deferred close expire: ctx stale "
+                           "after lock, abandoning %s\n", g_deferred[i].path);
                 pthread_mutex_unlock(&g_state.meta_lock);
                 g_deferred[i].active = 0;
             } else {
@@ -954,8 +1068,16 @@ static int deferred_close_fstat(const char *path, struct nfs_stat_64 *st)
 
     if (fstat_fh) {
         pthread_mutex_lock(&g_state.meta_lock);
-        if (nfs_fstat64(fstat_ctx, fstat_fh, st) == 0)
-            found = 1;
+        /* Skip if context is stale (reconnect swapped it) — the fh
+         * belongs to the old dead session and cannot be used. */
+        if (fstat_ctx == g_state.meta_nfs) {
+            if (nfs_fstat64(fstat_ctx, fstat_fh, st) == 0)
+                found = 1;
+        } else {
+            DBG(1, "nfsfuse: deferred fstat: stale ctx %p (cur=%p), "
+                   "skipping %s\n", (void *)fstat_ctx,
+                (void *)g_state.meta_nfs, path ? path : "");
+        }
         pthread_mutex_unlock(&g_state.meta_lock);
     }
 
@@ -980,6 +1102,13 @@ static int deferred_close_peek(const char *path, struct nfs_context **out_ctx,
     pthread_mutex_lock(&g_deferred_lock);
     for (i = 0; i < DEFERRED_CLOSE_MAX; i++) {
         if (g_deferred[i].active && strcmp(g_deferred[i].path, path) == 0) {
+            /* Skip if context is stale — the fh belongs to a dead
+             * session and using it would cause errors or crashes. */
+            if (g_deferred[i].ctx != g_state.meta_nfs) {
+                DBG(1, "nfsfuse: deferred close peek: stale ctx, "
+                       "skipping %s\n", path);
+                break;
+            }
             *out_ctx = g_deferred[i].ctx;
             *out_fh = g_deferred[i].fh;
             found = 1;
@@ -1102,6 +1231,15 @@ static void dead_timeout_on_success(void)
 
 static int classify_nfs_error(int rc)
 {
+    /*
+     * -EAGAIN from async wrappers means "NFS context was swapped
+     * (reconnect happened during this operation)."  The reconnect
+     * already happened — just retry with the new g_state.meta_nfs.
+     * Classify as RETRY_WAIT so the retry loop sleeps briefly (0.5s
+     * in async mode) then retries without triggering another reconnect.
+     */
+    if (rc == -EAGAIN)
+        return RETRY_WAIT;
     if (g_state.safe_v4_mode && rc == -ERANGE)
         return RETRY_RECONNECT;
     if (g_state.safe_v4_mode && rc == -EINVAL)
@@ -1127,6 +1265,8 @@ static const char *reconnect_reason(int rc)
         return "ESTALE";
     if (rc == -ETIMEDOUT)
         return "timeout";
+    if (rc == -EAGAIN)
+        return "context-changed";
     return "NFS error";
 }
 
@@ -1227,8 +1367,22 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
         if (old_ctx) {
             int old_fd = nfs_get_fd(old_ctx);
             nfs_set_autoreconnect(old_ctx, 0);
-            if (old_fd >= 0)
+            if (old_fd >= 0) {
                 shutdown(old_fd, SHUT_RDWR);
+                /*
+                 * Close the fd to free the privileged port it holds.
+                 * Without this, each reconnect leaks a port and after
+                 * ~500 reconnects all privileged ports are exhausted,
+                 * causing mount_new_context to fail permanently with
+                 * MNT3ERR_PERM / NFS4ERR_PERM (server rejects
+                 * connections from non-privileged ports).
+                 *
+                 * Safe because: shutdown() already made the fd
+                 * unusable — any thread blocked on it got an error,
+                 * and libnfs autoreconnect is disabled above.
+                 */
+                close(old_fd);
+            }
         }
     }
     {
@@ -1281,7 +1435,7 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
  */
 #define META_RETRY_ASYNC(rc, op, path, sync_call, async_call) do {       \
     int _retries = 0;                                                    \
-    int _did_reconnect = 0;                                              \
+    int _reconnect_count = 0;                                            \
     for (;;) {                                                           \
         if (g_state.dead_triggered) { (rc) = -EIO; break; }              \
         if (g_async_mode) {                                              \
@@ -1312,9 +1466,9 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
         if (_cls == RETRY_NONE || _retries >= g_nfs4_retry_max)          \
             break;                                                       \
         _retries++;                                                      \
-        if (_cls == RETRY_RECONNECT && !_did_reconnect) {                \
+        if (_cls == RETRY_RECONNECT && _reconnect_count < 3) {           \
             if (reconnect_meta_context((rc), (op), (path)) == 0)         \
-                _did_reconnect = 1;                                      \
+                _reconnect_count++;                                      \
             else                                                         \
                 break;                                                   \
         } else {                                                         \
@@ -1337,7 +1491,7 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
 /* Backward-compatible: sync-only META_RETRY */
 #define META_RETRY(rc, op, path, call) do {                              \
     int _retries = 0;                                                    \
-    int _did_reconnect = 0;                                              \
+    int _reconnect_count = 0;                                            \
     for (;;) {                                                           \
         if (g_state.dead_triggered) { (rc) = -EIO; break; }              \
         pthread_mutex_lock(&g_state.meta_lock);                          \
@@ -1358,9 +1512,9 @@ static int reconnect_meta_context(int rc, const char *op, const char *path)
         if (_cls == RETRY_NONE || _retries >= g_nfs4_retry_max)            \
             break;                                                       \
         _retries++;                                                      \
-        if (_cls == RETRY_RECONNECT && !_did_reconnect) {                \
+        if (_cls == RETRY_RECONNECT && _reconnect_count < 3) {           \
             if (reconnect_meta_context((rc), (op), (path)) == 0)         \
-                _did_reconnect = 1;                                      \
+                _reconnect_count++;                                      \
             else                                                         \
                 break;                                                   \
         } else {                                                         \
@@ -1657,7 +1811,14 @@ static struct nfs_context *mount_new_context(const char *url)
 
     DBG(1, "  nfs_mount...\n");
     if (nfs_mount(ctx, nurl->server, nurl->path) != 0) {
-        fprintf(stderr, "nfsfuse: mount failed: %s\n", nfs_get_error(ctx));
+        const char *mount_err = nfs_get_error(ctx);
+        fprintf(stderr, "nfsfuse: mount failed: %s\n",
+                mount_err ? mount_err : "unknown error");
+        if (g_log_errors)
+            syslog(LOG_ERR, "mount %s:%s failed: %s",
+                   nurl->server ? nurl->server : "?",
+                   nurl->path ? nurl->path : "?",
+                   mount_err ? mount_err : "unknown error");
         nfs_destroy_url(nurl);
         nfs_destroy_context(ctx);
         return NULL;
@@ -1737,18 +1898,19 @@ static void *keepalive_thread_func(void *arg)
 
             if (g_async_mode) {
                 /*
-                 * Async mode: release meta_lock immediately, then use
-                 * async_nfs_lstat64 which manages its own lock (brief
-                 * hold for nfs_service, released during poll).  This
-                 * prevents the keepalive from blocking the FUSE thread
-                 * for the full NFS timeout on a dead server.
+                 * Async mode: snapshot meta_nfs under lock, then release
+                 * it.  Use async_nfs_lstat64 which manages its own lock
+                 * (brief hold for nfs_service, released during poll).
+                 * This prevents the keepalive from blocking the FUSE
+                 * thread for the full NFS timeout on a dead server.
                  */
+                struct nfs_context *ka_ctx = g_state.meta_nfs;
                 pthread_mutex_unlock(&g_state.meta_lock);
-                if (g_state.meta_nfs) {
+                if (ka_ctx) {
                     DBG(3, "nfsfuse: watchdog: calling async nfs_lstat64...\n");
                     if (g_state.has_dead_timeout)
                         g_state.nfs_call_start = time(NULL);
-                    int ka_rc = async_nfs_lstat64(g_state.meta_nfs, "/", &st);
+                    int ka_rc = async_nfs_lstat64(ka_ctx, "/", &st);
                     if (g_state.has_dead_timeout)
                         g_state.nfs_call_start = 0;
                     if (ka_rc < 0) {
@@ -1818,14 +1980,14 @@ static void *keepalive_thread_func(void *arg)
                     /*
                      * Disable autoreconnect FIRST so libnfs doesn't
                      * create a new socket after we kill this one.
-                     * Then shutdown + close the fd to unblock any
-                     * blocking syscall (poll, recv, send, connect).
+                     * Then shutdown the fd to unblock any blocking
+                     * syscall (poll, recv, send, connect).
+                     * Do NOT close() — the fd is in use by another
+                     * thread and closing it causes fd reuse races.
                      */
                     nfs_set_autoreconnect(g_state.meta_nfs, 0);
-                    if (nfs_fd >= 0) {
+                    if (nfs_fd >= 0)
                         shutdown(nfs_fd, SHUT_RDWR);
-                        close(nfs_fd);
-                    }
                     g_state.meta_lock_busy_since = 0;
                 }
             }
@@ -2091,6 +2253,17 @@ static void file_handle_unlock(struct file_handle *h)
         pthread_mutex_unlock(&g_state.meta_lock);
 }
 
+/*
+ * For shared-context dir handles (own_ctx=0), always use the current
+ * g_state.meta_nfs rather than the stale h->ctx pointer.  After a
+ * reconnect, g_state.meta_nfs points to the new context while h->ctx
+ * still points to the old (dead) one.
+ */
+static struct nfs_context *dir_handle_ctx(struct dir_handle *h)
+{
+    return h->own_ctx ? h->ctx : g_state.meta_nfs;
+}
+
 static void dir_handle_lock(struct dir_handle *h)
 {
     if (h->own_ctx)
@@ -2282,7 +2455,11 @@ static int try_reopen_after_error(struct file_handle *h)
     if (h->own_ctx || h->borrowed || h->path[0] == '\0')
         return -1;  /* can't reopen */
 
+    /* Snapshot the current context under lock to avoid TOCTOU race.
+     * The async_nfs_open will verify ctx == meta_nfs again under lock. */
+    pthread_mutex_lock(&g_state.meta_lock);
     cur_ctx = g_state.meta_nfs;
+    pthread_mutex_unlock(&g_state.meta_lock);
 
     /* Only reopen if the context actually changed (reconnect happened).
      * If same context, the error is not about stale stateids — reopening
@@ -2302,7 +2479,9 @@ static int try_reopen_after_error(struct file_handle *h)
                "(old_ctx=%p new_ctx=%p)", h->path,
                (void *)h->open_ctx, (void *)cur_ctx);
 
-    /* Use async open to avoid blocking meta_lock */
+    /* Use async open to avoid blocking meta_lock.
+     * async_nfs_open validates ctx == meta_nfs under lock before
+     * submitting the request. */
     rc = async_nfs_open(cur_ctx, h->path, h->open_flags, &new_fh);
 
     if (rc < 0) {
@@ -2310,9 +2489,12 @@ static int try_reopen_after_error(struct file_handle *h)
         return rc;
     }
 
-    /* Don't close old fh — old context may be dead */
+    /* Update handle atomically under meta_lock.
+     * Don't close old fh — old context may be dead. */
+    pthread_mutex_lock(&g_state.meta_lock);
     h->fh = new_fh;
     h->open_ctx = cur_ctx;
+    pthread_mutex_unlock(&g_state.meta_lock);
 
     DBG(1, "nfsfuse: reopen: success, new fh=%p\n", (void *)new_fh);
     return 0;
@@ -2337,8 +2519,10 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
             if (g_state.dead_triggered) { rc = -EIO; break; }
             if (g_state.has_dead_timeout) g_state.nfs_call_start = time(NULL);
             if (g_async_mode && !h->own_ctx) {
+                struct nfs_context *io_ctx = file_handle_ctx(h);
+                struct nfsfh *io_fh = h->fh;
                 file_handle_unlock(h);
-                rc = async_nfs_pread(file_handle_ctx(h), h->fh,
+                rc = async_nfs_pread(io_ctx, io_fh,
                                      (uint64_t)(offset + (off_t)done),
                                      chunk, buf + done);
                 file_handle_lock(h);
@@ -2359,30 +2543,35 @@ static int pread_full(struct file_handle *h, char *buf, size_t size, off_t offse
             if (_rcls == RETRY_NONE)
                 break;
             if (io_retries >= g_nfs4_retry_max) {
+                int reconnect_ok = 0;
                 if (_rcls == RETRY_RECONNECT) {
                     file_handle_unlock(h);
-                    reconnect_meta_context(rc, "read", NULL);
+                    reconnect_ok = (reconnect_meta_context(rc, "read", NULL) == 0);
                     file_handle_lock(h);
-                    rc = -EIO;
+                    if (!reconnect_ok) {
+                        rc = -EIO;
+                        break;
+                    }
                 }
                 /* Try reactive reopen — the file handle's stateid
                  * may be dead after a reconnect.  Reopen gets a
                  * fresh stateid and the next read attempt may work.
-                 * Limit reopens to 2 to prevent infinite loop:
+                 * Limit reopens to 5 to prevent infinite loop:
                  * reconnect → reopen → fail → reconnect → reopen → ... */
                 file_handle_unlock(h);
-                if (reopen_count < 2 && try_reopen_after_error(h) == 0) {
+                if (reopen_count < 5 && try_reopen_after_error(h) == 0) {
                     reopen_count++;
-                    DBG(1, "nfsfuse: read: reopened (%d/2), "
+                    DBG(1, "nfsfuse: read: reopened (%d/5), "
                            "resetting retries\n", reopen_count);
                     file_handle_lock(h);
                     io_retries = 0;
                     continue;  /* retry with fresh handle */
                 }
                 file_handle_lock(h);
+                rc = -EIO;
                 if (g_log_errors)
                     syslog(LOG_ERR,
-                           "read failed after %d retries, %d reopens "
+                           "read exhausted %d retries, %d reopens "
                            "(rc=%d/%s)",
                            io_retries, reopen_count, rc, strerror(-rc));
                 break;
@@ -2443,8 +2632,10 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
             if (g_state.dead_triggered) { rc = -EIO; break; }
             if (g_state.has_dead_timeout) g_state.nfs_call_start = time(NULL);
             if (g_async_mode && !h->own_ctx) {
+                struct nfs_context *io_ctx = file_handle_ctx(h);
+                struct nfsfh *io_fh = h->fh;
                 file_handle_unlock(h);
-                rc = async_nfs_pwrite(file_handle_ctx(h), h->fh,
+                rc = async_nfs_pwrite(io_ctx, io_fh,
                                       (uint64_t)(offset + (off_t)done),
                                       chunk, buf + done);
                 file_handle_lock(h);
@@ -2465,26 +2656,31 @@ static int pwrite_full(struct file_handle *h, const char *buf, size_t size, off_
             if (_wcls == RETRY_NONE)
                 break;
             if (io_retries >= g_nfs4_retry_max) {
+                int reconnect_ok = 0;
                 if (_wcls == RETRY_RECONNECT) {
                     file_handle_unlock(h);
-                    reconnect_meta_context(rc, "write", NULL);
+                    reconnect_ok = (reconnect_meta_context(rc, "write", NULL) == 0);
                     file_handle_lock(h);
-                    rc = -EIO;
+                    if (!reconnect_ok) {
+                        rc = -EIO;
+                        break;
+                    }
                 }
-                /* Limit reopens to 2 to prevent infinite loop */
+                /* Limit reopens to 5 to prevent infinite loop */
                 file_handle_unlock(h);
-                if (reopen_count < 2 && try_reopen_after_error(h) == 0) {
+                if (reopen_count < 5 && try_reopen_after_error(h) == 0) {
                     reopen_count++;
-                    DBG(1, "nfsfuse: write: reopened (%d/2), "
+                    DBG(1, "nfsfuse: write: reopened (%d/5), "
                            "resetting retries\n", reopen_count);
                     file_handle_lock(h);
                     io_retries = 0;
                     continue;
                 }
                 file_handle_lock(h);
+                rc = -EIO;
                 if (g_log_errors)
                     syslog(LOG_ERR,
-                           "write failed after %d retries, %d reopens "
+                           "write exhausted %d retries, %d reopens "
                            "(rc=%d/%s)",
                            io_retries, reopen_count, rc, strerror(-rc));
                 break;
@@ -2588,9 +2784,9 @@ static int dir_snapshot_load(struct dir_handle *h)
         return 0;
 
     dir_handle_lock(h);
-    nfs_rewinddir(h->ctx, h->dir);
+    nfs_rewinddir(dir_handle_ctx(h), h->dir);
 
-    while ((ent = nfs_readdir(h->ctx, h->dir)) != NULL) {
+    while ((ent = nfs_readdir(dir_handle_ctx(h), h->dir)) != NULL) {
         rc = dir_snapshot_push(h, ent);
         if (rc < 0)
             break;
@@ -2626,7 +2822,17 @@ static int nfuse_getattr(const char *path, struct stat *stbuf, struct fuse_file_
                 file_handle_lock(h);
                 rc = nfs_fstat64(file_handle_ctx(h), h->fh, &st);
                 file_handle_unlock(h);
-                did_fstat = 1;
+                /* On transient error, fall through to path-based stat
+                 * which has META_RETRY logic for reconnect/recovery. */
+                if (rc >= 0)
+                    did_fstat = 1;
+                else if (classify_nfs_error(rc) != RETRY_NONE) {
+                    DBG(1, "nfsfuse: getattr %s: fstat transient error "
+                           "(rc=%d), falling through to path-based\n",
+                        path ? path : "", rc);
+                } else {
+                    did_fstat = 1;  /* permanent error, don't retry */
+                }
             } else {
                 DBG(1, "nfsfuse: getattr %s: stale handle, using "
                        "path-based stat\n", path ? path : "");
@@ -2800,7 +3006,7 @@ static int nfuse_releasedir(const char *path, struct fuse_file_info *fi)
     dir_snapshot_free(h);
 
     dir_handle_lock(h);
-    nfs_closedir(h->ctx, h->dir);
+    nfs_closedir(dir_handle_ctx(h), h->dir);
     dir_handle_unlock(h);
 
     if (h->own_ctx)
@@ -2829,7 +3035,7 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
      * Only release after the fresh open succeeds.
      */
     {
-        int retries = 0, did_reconnect = 0;
+        int retries = 0, reconnect_count = 0;
         for (;;) {
             rc = open_file_handle_common(path, flags, 0, 0, &h);
             if (rc >= 0)
@@ -2838,9 +3044,9 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
             if (cls == RETRY_NONE || retries >= g_nfs4_retry_max)
                 break;
             retries++;
-            if (cls == RETRY_RECONNECT && !did_reconnect) {
+            if (cls == RETRY_RECONNECT && reconnect_count < 3) {
                 if (reconnect_meta_context(rc, "open", path) == 0)
-                    did_reconnect = 1;
+                    reconnect_count++;
                 else
                     break;
             } else {
@@ -2883,6 +3089,9 @@ static int nfuse_open(const char *path, struct fuse_file_info *fi)
                 h->own_ctx = 0;
                 h->writable = 0;
                 h->borrowed = 1;  /* pool owns the NFS handle */
+                h->open_ctx = dc_ctx;  /* for stale-handle detection */
+                if (path)
+                    snprintf(h->path, sizeof(h->path), "%s", path);
                 if (pthread_mutex_init(&h->lock, NULL) == 0) {
                     rc = 0;  /* success — using promoted handle */
                 } else {
@@ -2920,7 +3129,7 @@ static int nfuse_create(const char *path, mode_t mode, struct fuse_file_info *fi
         path ? path : "(null)", (int)mode, flags);
 
     {
-        int retries = 0, did_reconnect = 0;
+        int retries = 0, reconnect_count = 0;
         for (;;) {
             rc = open_file_handle_common(path, flags, mode, 1, &h);
             if (rc >= 0)
@@ -2929,9 +3138,9 @@ static int nfuse_create(const char *path, mode_t mode, struct fuse_file_info *fi
             if (cls == RETRY_NONE || retries >= g_nfs4_retry_max)
                 break;
             retries++;
-            if (cls == RETRY_RECONNECT && !did_reconnect) {
+            if (cls == RETRY_RECONNECT && reconnect_count < 3) {
                 if (reconnect_meta_context(rc, "create", path) == 0)
-                    did_reconnect = 1;
+                    reconnect_count++;
                 else
                     break;
             } else {
@@ -2990,10 +3199,11 @@ static int nfuse_release(const char *path, struct fuse_file_info *fi)
 
     if (h->writable && !handle_stale && !g_state.dead_triggered) {
         if (g_async_mode && !h->own_ctx) {
-            /* Use async fsync to avoid holding meta_lock for the
-             * full NFS timeout on a dead server. */
+            /* Snapshot ctx/fh under lock before releasing for async */
+            struct nfs_context *rel_ctx = file_handle_ctx(h);
+            struct nfsfh *rel_fh = h->fh;
             file_handle_unlock(h);
-            async_nfs_fsync(file_handle_ctx(h), h->fh);
+            async_nfs_fsync(rel_ctx, rel_fh);
             file_handle_lock(h);
         } else {
             nfs_fsync(file_handle_ctx(h), h->fh);
@@ -3012,14 +3222,18 @@ static int nfuse_release(const char *path, struct fuse_file_info *fi)
         file_handle_unlock(h);
     } else if (h->writable && !h->own_ctx && g_state.safe_v4_mode &&
                path && !handle_stale) {
+        struct nfs_context *dc_ctx = file_handle_ctx(h);
+        struct nfsfh *dc_fh = h->fh;
         file_handle_unlock(h);
-        deferred_close_add(path, file_handle_ctx(h), h->fh);
+        deferred_close_add(path, dc_ctx, dc_fh);
         /* Don't close the NFS handle — it's now owned by deferred pool */
     } else {
         if (!handle_stale && !g_state.dead_triggered) {
             if (g_async_mode && !h->own_ctx) {
+                struct nfs_context *cl_ctx = file_handle_ctx(h);
+                struct nfsfh *cl_fh = h->fh;
                 file_handle_unlock(h);
-                async_nfs_close(file_handle_ctx(h), h->fh);
+                async_nfs_close(cl_ctx, cl_fh);
                 file_handle_lock(h);
             } else {
                 nfs_close(file_handle_ctx(h), h->fh);
@@ -3092,7 +3306,14 @@ static int nfuse_truncate(const char *path, off_t size, struct fuse_file_info *f
                 file_handle_lock(h);
                 rc = nfs_ftruncate(file_handle_ctx(h), h->fh, (uint64_t)size);
                 file_handle_unlock(h);
-                did_ftrunc = 1;
+                if (rc >= 0)
+                    did_ftrunc = 1;
+                else if (classify_nfs_error(rc) != RETRY_NONE)
+                    DBG(1, "nfsfuse: truncate %s: ftruncate transient "
+                           "error (rc=%d), falling through\n",
+                        path ? path : "", rc);
+                else
+                    did_ftrunc = 1;
             }
         }
 
@@ -3315,7 +3536,14 @@ static int nfuse_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
                 file_handle_lock(h);
                 rc = nfs_fchmod(file_handle_ctx(h), h->fh, mode);
                 file_handle_unlock(h);
-                did_fchmod = 1;
+                if (rc >= 0)
+                    did_fchmod = 1;
+                else if (classify_nfs_error(rc) != RETRY_NONE)
+                    DBG(1, "nfsfuse: chmod %s: fchmod transient error "
+                           "(rc=%d), falling through\n",
+                        path ? path : "", rc);
+                else
+                    did_fchmod = 1;
             }
         }
 
@@ -3353,7 +3581,14 @@ static int nfuse_chown(const char *path, uid_t uid, gid_t gid,
                 file_handle_lock(h);
                 rc = nfs_fchown(file_handle_ctx(h), h->fh, uid, gid);
                 file_handle_unlock(h);
-                did_fchown = 1;
+                if (rc >= 0)
+                    did_fchown = 1;
+                else if (classify_nfs_error(rc) != RETRY_NONE)
+                    DBG(1, "nfsfuse: chown %s: fchown transient error "
+                           "(rc=%d), falling through\n",
+                        path ? path : "", rc);
+                else
+                    did_fchown = 1;
             }
         }
 
@@ -3408,7 +3643,8 @@ static int nfuse_access(const char *path, int mask)
 static int nfuse_flush(const char *path, struct fuse_file_info *fi)
 {
     struct file_handle *h;
-    int rc;
+    int rc = 0;
+    int retries = 0;
 
     if (fi == NULL || fi->fh == 0)
         return 0;
@@ -3431,16 +3667,35 @@ static int nfuse_flush(const char *path, struct fuse_file_info *fi)
 
     DBG(2, "nfsfuse: flush (fsync) %s\n", path ? path : "(null)");
 
-    if (g_async_mode && !h->own_ctx) {
-        rc = async_nfs_fsync(file_handle_ctx(h), h->fh);
-    } else {
-        file_handle_lock(h);
-        if (g_state.has_dead_timeout)
-            g_state.nfs_call_start = time(NULL);
-        rc = nfs_fsync(file_handle_ctx(h), h->fh);
-        if (g_state.has_dead_timeout)
-            g_state.nfs_call_start = 0;
-        file_handle_unlock(h);
+    for (retries = 0; retries <= g_nfs4_retry_max; retries++) {
+        if (g_state.dead_triggered) { rc = -EIO; break; }
+        if (g_async_mode && !h->own_ctx) {
+            struct nfs_context *fs_ctx = file_handle_ctx(h);
+            rc = async_nfs_fsync(fs_ctx, h->fh);
+        } else {
+            file_handle_lock(h);
+            if (g_state.has_dead_timeout)
+                g_state.nfs_call_start = time(NULL);
+            rc = nfs_fsync(file_handle_ctx(h), h->fh);
+            if (g_state.has_dead_timeout)
+                g_state.nfs_call_start = 0;
+            file_handle_unlock(h);
+        }
+        if (rc >= 0) {
+            dead_timeout_on_success();
+            break;
+        }
+        dead_timeout_on_failure();
+        if (classify_nfs_error(rc) == RETRY_NONE)
+            break;
+        if (retries < g_nfs4_retry_max) {
+            DBG(1, "nfsfuse: flush %s: transient error, retry %d/%d\n",
+                path ? path : "", retries + 1, g_nfs4_retry_max);
+            if (g_async_mode)
+                usleep(500000);
+            else
+                sleep(g_nfs4_retry_wait);
+        }
     }
 
     if (rc < 0)
@@ -3452,7 +3707,8 @@ static int nfuse_flush(const char *path, struct fuse_file_info *fi)
 static int nfuse_fsync(const char *path, int datasync, struct fuse_file_info *fi)
 {
     struct file_handle *h;
-    int rc;
+    int rc = 0;
+    int retries = 0;
 
     (void)path;
     (void)datasync;
@@ -3474,16 +3730,35 @@ static int nfuse_fsync(const char *path, int datasync, struct fuse_file_info *fi
     if (g_state.dead_triggered)
         return -EIO;
 
-    if (g_async_mode && !h->own_ctx) {
-        rc = async_nfs_fsync(file_handle_ctx(h), h->fh);
-    } else {
-        file_handle_lock(h);
-        if (g_state.has_dead_timeout)
-            g_state.nfs_call_start = time(NULL);
-        rc = nfs_fsync(file_handle_ctx(h), h->fh);
-        if (g_state.has_dead_timeout)
-            g_state.nfs_call_start = 0;
-        file_handle_unlock(h);
+    for (retries = 0; retries <= g_nfs4_retry_max; retries++) {
+        if (g_state.dead_triggered) { rc = -EIO; break; }
+        if (g_async_mode && !h->own_ctx) {
+            struct nfs_context *fs_ctx = file_handle_ctx(h);
+            rc = async_nfs_fsync(fs_ctx, h->fh);
+        } else {
+            file_handle_lock(h);
+            if (g_state.has_dead_timeout)
+                g_state.nfs_call_start = time(NULL);
+            rc = nfs_fsync(file_handle_ctx(h), h->fh);
+            if (g_state.has_dead_timeout)
+                g_state.nfs_call_start = 0;
+            file_handle_unlock(h);
+        }
+        if (rc >= 0) {
+            dead_timeout_on_success();
+            break;
+        }
+        dead_timeout_on_failure();
+        if (classify_nfs_error(rc) == RETRY_NONE)
+            break;
+        if (retries < g_nfs4_retry_max) {
+            DBG(1, "nfsfuse: fsync %s: transient error, retry %d/%d\n",
+                path ? path : "", retries + 1, g_nfs4_retry_max);
+            if (g_async_mode)
+                usleep(500000);
+            else
+                sleep(g_nfs4_retry_wait);
+        }
     }
 
     if (rc < 0)
