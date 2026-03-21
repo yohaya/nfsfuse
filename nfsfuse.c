@@ -3643,7 +3643,7 @@ static int nfuse_access(const char *path, int mask)
 static int nfuse_flush(const char *path, struct fuse_file_info *fi)
 {
     struct file_handle *h;
-    int rc;
+    int rc = 0;
     int retries = 0;
 
     if (fi == NULL || fi->fh == 0)
@@ -3707,7 +3707,7 @@ static int nfuse_flush(const char *path, struct fuse_file_info *fi)
 static int nfuse_fsync(const char *path, int datasync, struct fuse_file_info *fi)
 {
     struct file_handle *h;
-    int rc;
+    int rc = 0;
     int retries = 0;
 
     (void)path;
